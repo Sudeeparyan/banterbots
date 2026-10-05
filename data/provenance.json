@@ -1,0 +1,16 @@
+{
+  "source": "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_2024.csv.gz",
+  "source_compressed_sha256": "23370d5d10f8104d80d46a1fc5e61f4f6f5a3263fe96fe2dd629913cfcb08c06",
+  "teams_source": "https://raw.githubusercontent.com/nflverse/nflverse-pbp/master/teams_colors_logos.csv",
+  "replay_files": {
+    "2024_01_BAL_KC.json": {
+      "plays": 178,
+      "sha256": "ac49a4a68878523a3a13bba83005ac0a0eafe38c7646cf542f2e3fa3e2f7a629"
+    },
+    "2024_22_KC_PHI.json": {
+      "plays": 176,
+      "sha256": "708754ccd43723205a9ee7705433309b0f816b95d67d262ca23028727a0de39b"
+    }
+  },
+  "license": "CC BY 4.0 (nflverse play-by-play); logos remain team/league trademarks"
+}

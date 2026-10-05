@@ -1,0 +1,258 @@
+[
+  {
+    "id": "ARI",
+    "name": "Arizona Cardinals",
+    "abbreviation": "ARI",
+    "color": "#97233F",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/ARI.png"
+  },
+  {
+    "id": "ATL",
+    "name": "Atlanta Falcons",
+    "abbreviation": "ATL",
+    "color": "#A71930",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/ATL.png"
+  },
+  {
+    "id": "BAL",
+    "name": "Baltimore Ravens",
+    "abbreviation": "BAL",
+    "color": "#241773",
+    "alternate_color": "#9E7C0C",
+    "logo": "/assets/teams/BAL.png"
+  },
+  {
+    "id": "BUF",
+    "name": "Buffalo Bills",
+    "abbreviation": "BUF",
+    "color": "#00338D",
+    "alternate_color": "#C60C30",
+    "logo": "/assets/teams/BUF.png"
+  },
+  {
+    "id": "CAR",
+    "name": "Carolina Panthers",
+    "abbreviation": "CAR",
+    "color": "#0085CA",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/CAR.png"
+  },
+  {
+    "id": "CHI",
+    "name": "Chicago Bears",
+    "abbreviation": "CHI",
+    "color": "#0B162A",
+    "alternate_color": "#E64100",
+    "logo": "/assets/teams/CHI.png"
+  },
+  {
+    "id": "CIN",
+    "name": "Cincinnati Bengals",
+    "abbreviation": "CIN",
+    "color": "#FB4F14",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/CIN.png"
+  },
+  {
+    "id": "CLE",
+    "name": "Cleveland Browns",
+    "abbreviation": "CLE",
+    "color": "#FF3C00",
+    "alternate_color": "#311D00",
+    "logo": "/assets/teams/CLE.png"
+  },
+  {
+    "id": "DAL",
+    "name": "Dallas Cowboys",
+    "abbreviation": "DAL",
+    "color": "#002244",
+    "alternate_color": "#B0B7BC",
+    "logo": "/assets/teams/DAL.png"
+  },
+  {
+    "id": "DEN",
+    "name": "Denver Broncos",
+    "abbreviation": "DEN",
+    "color": "#002244",
+    "alternate_color": "#FB4F14",
+    "logo": "/assets/teams/DEN.png"
+  },
+  {
+    "id": "DET",
+    "name": "Detroit Lions",
+    "abbreviation": "DET",
+    "color": "#0076B6",
+    "alternate_color": "#B0B7BC",
+    "logo": "/assets/teams/DET.png"
+  },
+  {
+    "id": "GB",
+    "name": "Green Bay Packers",
+    "abbreviation": "GB",
+    "color": "#203731",
+    "alternate_color": "#FFB612",
+    "logo": "/assets/teams/GB.png"
+  },
+  {
+    "id": "HOU",
+    "name": "Houston Texans",
+    "abbreviation": "HOU",
+    "color": "#03202F",
+    "alternate_color": "#A71930",
+    "logo": "/assets/teams/HOU.png"
+  },
+  {
+    "id": "IND",
+    "name": "Indianapolis Colts",
+    "abbreviation": "IND",
+    "color": "#002C5F",
+    "alternate_color": "#a5acaf",
+    "logo": "/assets/teams/IND.png"
+  },
+  {
+    "id": "JAX",
+    "name": "Jacksonville Jaguars",
+    "abbreviation": "JAX",
+    "color": "#006778",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/JAX.png"
+  },
+  {
+    "id": "KC",
+    "name": "Kansas City Chiefs",
+    "abbreviation": "KC",
+    "color": "#E31837",
+    "alternate_color": "#FFB612",
+    "logo": "/assets/teams/KC.png"
+  },
+  {
+    "id": "LAC",
+    "name": "Los Angeles Chargers",
+    "abbreviation": "LAC",
+    "color": "#007BC7",
+    "alternate_color": "#ffc20e",
+    "logo": "/assets/teams/LAC.png"
+  },
+  {
+    "id": "LAR",
+    "name": "Los Angeles Rams",
+    "abbreviation": "LAR",
+    "color": "#003594",
+    "alternate_color": "#FFD100",
+    "logo": "/assets/teams/LAR.png"
+  },
+  {
+    "id": "LV",
+    "name": "Las Vegas Raiders",
+    "abbreviation": "LV",
+    "color": "#000000",
+    "alternate_color": "#A5ACAF",
+    "logo": "/assets/teams/LV.png"
+  },
+  {
+    "id": "MIA",
+    "name": "Miami Dolphins",
+    "abbreviation": "MIA",
+    "color": "#008E97",
+    "alternate_color": "#F58220",
+    "logo": "/assets/teams/MIA.png"
+  },
+  {
+    "id": "MIN",
+    "name": "Minnesota Vikings",
+    "abbreviation": "MIN",
+    "color": "#4F2683",
+    "alternate_color": "#FFC62F",
+    "logo": "/assets/teams/MIN.png"
+  },
+  {
+    "id": "NE",
+    "name": "New England Patriots",
+    "abbreviation": "NE",
+    "color": "#002244",
+    "alternate_color": "#C60C30",
+    "logo": "/assets/teams/NE.png"
+  },
+  {
+    "id": "NO",
+    "name": "New Orleans Saints",
+    "abbreviation": "NO",
+    "color": "#D3BC8D",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/NO.png"
+  },
+  {
+    "id": "NYG",
+    "name": "New York Giants",
+    "abbreviation": "NYG",
+    "color": "#0B2265",
+    "alternate_color": "#A71930",
+    "logo": "/assets/teams/NYG.png"
+  },
+  {
+    "id": "NYJ",
+    "name": "New York Jets",
+    "abbreviation": "NYJ",
+    "color": "#003F2D",
+    "alternate_color": "#000000",
+    "logo": "/assets/teams/NYJ.png"
+  },
+  {
+    "id": "PHI",
+    "name": "Philadelphia Eagles",
+    "abbreviation": "PHI",
+    "color": "#004C54",
+    "alternate_color": "#A5ACAF",
+    "logo": "/assets/teams/PHI.png"
+  },
+  {
+    "id": "PIT",
+    "name": "Pittsburgh Steelers",
+    "abbreviation": "PIT",
+    "color": "#000000",
+    "alternate_color": "#FFB612",
+    "logo": "/assets/teams/PIT.png"
+  },
+  {
+    "id": "SEA",
+    "name": "Seattle Seahawks",
+    "abbreviation": "SEA",
+    "color": "#002244",
+    "alternate_color": "#69be28",
+    "logo": "/assets/teams/SEA.png"
+  },
+  {
+    "id": "SF",
+    "name": "San Francisco 49ers",
+    "abbreviation": "SF",
+    "color": "#AA0000",
+    "alternate_color": "#B3995D",
+    "logo": "/assets/teams/SF.png"
+  },
+  {
+    "id": "TB",
+    "name": "Tampa Bay Buccaneers",
+    "abbreviation": "TB",
+    "color": "#A71930",
+    "alternate_color": "#322F2B",
+    "logo": "/assets/teams/TB.png"
+  },
+  {
+    "id": "TEN",
+    "name": "Tennessee Titans",
+    "abbreviation": "TEN",
+    "color": "#4495D2",
+    "alternate_color": "#D50A0A",
+    "logo": "/assets/teams/TEN.png"
+  },
+  {
+    "id": "WAS",
+    "name": "Washington Commanders",
+    "abbreviation": "WAS",
+    "color": "#5A1414",
+    "alternate_color": "#FFB612",
+    "logo": "/assets/teams/WAS.png"
+  }
+]
