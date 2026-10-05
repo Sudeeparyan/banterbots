@@ -10,7 +10,7 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.txt
       - run: ruff check backend tools tests
-      - run: pytest -q
+      - run: python -m pytest -q
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
