@@ -14,6 +14,8 @@ by selecting these two games, ordering plays by provider `order_sequence`,
 mapping team aliases to current abbreviations, and retaining only causal game
 facts. `provenance.json` records the downloaded compressed source SHA-256 and
 each normalized fixture SHA-256.
+JSON fixtures use LF line endings, enforced by `.gitattributes` and the importer,
+so those hashes remain identical on Windows and Linux.
 
 Scores use **post-play `total_home_score` and `total_away_score`**, never the
 source columns `home_score` and `away_score`, which hold final results on every

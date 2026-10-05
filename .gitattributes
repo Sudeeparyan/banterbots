@@ -1,0 +1,2 @@
+# Preserve replay provenance hashes across Windows and Linux checkouts.
+data/*.json text eol=lf

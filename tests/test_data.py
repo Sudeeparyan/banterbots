@@ -94,6 +94,13 @@ def test_bundled_file_hashes_match_provenance():
         assert hashlib.sha256((DATA / name).read_bytes()).hexdigest() == details["sha256"]
 
 
+def test_fixture_export_has_portable_lf_bytes(tmp_path):
+    from tools.import_nflverse import write_json
+    path = tmp_path / "fixture.json"
+    write_json(path, {"score": 6})
+    assert path.read_bytes() == b'{\n  "score": 6\n}\n'
+
+
 def test_unknown_replay_id_cannot_access_paths():
     with pytest.raises(ValueError, match="Unknown replay"):
         get_replay_events("../teams")

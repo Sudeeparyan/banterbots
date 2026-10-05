@@ -2,10 +2,11 @@
 
 Checked locally on Windows on October 5, 2026, without OpenAI credentials.
 
-- Backend: **73 tests passed**, including real A2A HTTP calls in both directions,
+- Backend: **74 tests passed**, including real A2A HTTP calls in both directions,
   matching snapshot hashes, cancellation during peer generation, causal replay
   scores, corrections, feed recovery, queue pressure, persistence, WebSocket
   ownership/reconnect, and speech ordering/failure boundaries.
+  Replay export also verifies portable LF bytes so provenance survives Git checkouts.
 - Frontend: **15 tests passed**; TypeScript checks and Vite production build passed.
 - Browser: **3 isolated Chromium checks passed**, covering desktop, mobile,
   all 32 loaded team logos, actual agent lead alternation, debugger, restart,

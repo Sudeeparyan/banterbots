@@ -5,11 +5,11 @@
   "replay_files": {
     "2024_01_BAL_KC.json": {
       "plays": 178,
-      "sha256": "ac49a4a68878523a3a13bba83005ac0a0eafe38c7646cf542f2e3fa3e2f7a629"
+      "sha256": "ad1a16503e7ba4ad458d2252856d85ed5f1f8c7570901a64be35a13602570101"
     },
     "2024_22_KC_PHI.json": {
       "plays": 176,
-      "sha256": "708754ccd43723205a9ee7705433309b0f816b95d67d262ca23028727a0de39b"
+      "sha256": "181e57fb8cdfd0a1b113070a071a1794dd42e32d4dca4e164def4072aa3d9d62"
     }
   },
   "license": "CC BY 4.0 (nflverse play-by-play); logos remain team/league trademarks"
