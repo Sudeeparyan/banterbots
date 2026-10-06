@@ -106,10 +106,13 @@ class SpeechFailure(RuntimeError):
 
 
 async def speak(request: AgentRequest, turn: CommentaryTurn, emit: Emit, client_factory=None,
-                max_seconds: float = 10, finalization_seconds: float = 15) -> CommentaryTurn:
+                max_seconds: float = 10, finalization_seconds: float = 15,
+                io_timeout: float = 10) -> CommentaryTurn:
     observations: list[SpeechObserver] = []
     try:
-        return await _speak_impl(request, turn, emit, client_factory, max_seconds, finalization_seconds, observations)
+        if any(not math.isfinite(value) or value <= 0 for value in (max_seconds, finalization_seconds, io_timeout)):
+            raise ValueError("Speech time limits must be finite and positive")
+        return await _speak_impl(request, turn, emit, client_factory, max_seconds, finalization_seconds, observations, io_timeout)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -118,7 +121,7 @@ async def speak(request: AgentRequest, turn: CommentaryTurn, emit: Emit, client_
 
 async def _speak_impl(request: AgentRequest, turn: CommentaryTurn, emit: Emit, client_factory,
                       max_seconds: float, finalization_seconds: float,
-                      observations: list[SpeechObserver]) -> CommentaryTurn:
+                      observations: list[SpeechObserver], io_timeout: float) -> CommentaryTurn:
     """Finalize observed speech before another agent receives the turn.
 
     All PCM artifacts are ordered and one turn owns each segment. A speech error
@@ -131,21 +134,29 @@ async def _speak_impl(request: AgentRequest, turn: CommentaryTurn, emit: Emit, c
     finalized = False
     sender = None
     close_at: float | None = None
+
+    async def send(operation: str, pending) -> None:
+        # WebSocket writes have no response event to drive the receive-loop
+        # clock. Bound them separately so a blocked send cannot strand a turn.
+        try:
+            await asyncio.wait_for(pending, timeout=io_timeout)
+        except TimeoutError:
+            raise RuntimeError(f"GPT-Live {operation} timed out") from None
+
     async with factory(timeout=20, max_retries=0) as client:
         async with client.live.connect() as connection:
-            await connection.session.start(session=voice_session(request, turn), event_id=f"start_{turn.id}")
-
             async def silence() -> None:
                 deadline = time.monotonic()
                 while close_at is None:
-                    await connection.session.input_audio.append(audio=SILENCE_FRAME)
+                    await send("silent input", connection.session.input_audio.append(audio=SILENCE_FRAME))
                     deadline += FRAME_MS / 1000
                     await asyncio.sleep(max(0, deadline - time.monotonic()))
 
-            await emit({"type": "trace", "data": {"node": "speak", "phase": "start", "model": VOICE_MODEL,
-                                                      "voice": turn.voice, "turn_id": turn.id}})
             receiver = connection.__aiter__()
             try:
+                await emit({"type": "trace", "data": {"node": "speak", "phase": "start", "model": VOICE_MODEL,
+                                                          "voice": turn.voice, "turn_id": turn.id}})
+                await send("session start", connection.session.start(session=voice_session(request, turn), event_id=f"start_{turn.id}"))
                 startup_at = time.monotonic()
                 while True:
                     try:
@@ -158,9 +169,9 @@ async def _speak_impl(request: AgentRequest, turn: CommentaryTurn, emit: Emit, c
                         observer = SpeechObserver(time.monotonic(), time.monotonic())
                         observations.append(observer)
                         sender = asyncio.create_task(silence())
-                        await connection.session.instructions.append(
+                        await send("speech instructions", connection.session.instructions.append(
                             event_id=f"speak_{turn.id}", delegation_id=None,
-                            content=f"Begin now in English. Say this short commentary exactly once: {turn.text} Then pause and listen.")
+                            content=f"Begin now in English. Say this short commentary exactly once: {turn.text} Then pause and listen."))
                         await emit({"type": "trace", "data": {"node": "speak", "phase": "ready", "turn_id": turn.id,
                                                                   "voice_session_id": event.session.id}})
                         break
@@ -209,7 +220,7 @@ async def _speak_impl(request: AgentRequest, turn: CommentaryTurn, emit: Emit, c
                             if observed:
                                 boundary = observed
                                 close_at = timestamp
-                                await connection.session.close()
+                                await send("session close", connection.session.close())
                         elif timestamp - close_at > finalization_seconds:
                             raise TimeoutError("GPT-Live session.closed was not received; final usage is unconfirmed")
                 finally:

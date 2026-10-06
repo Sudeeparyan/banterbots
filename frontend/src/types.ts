@@ -21,6 +21,7 @@ export type Game = {
   play_count?: number;
 };
 export type PlayEvent = {
+  source?: string;
   id: string;
   sequence: number;
   revision: number;
@@ -121,22 +122,52 @@ export type SavedRun = {
   created_at?: string;
   turn_count?: number;
 };
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch('/api' + path, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+export async function api<T>(path: string, init?: RequestInit, timeoutMs = 45000): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+    throw new Error('Request timeout must be finite and positive');
+  const headers = new Headers(init?.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const callerSignal = init?.signal;
+  if (callerSignal?.aborted)
+    throw callerSignal.reason ?? new DOMException('Request cancelled', 'AbortError');
+  const controller = new AbortController();
+  const cancel = () => controller.abort(callerSignal?.reason);
+  callerSignal?.addEventListener('abort', cancel, { once: true });
+  const timeoutError = new Error(
+    'The request timed out. Check the studio connection and try again.',
+  );
+  timeoutError.name = 'TimeoutError';
+  const timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+  let aborted: () => void = () => {};
+  const cancellation = new Promise<never>((_, reject) => {
+    aborted = () =>
+      reject(controller.signal.reason ?? new DOMException('Request cancelled', 'AbortError'));
+    controller.signal.addEventListener('abort', aborted, { once: true });
   });
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = await response.json();
-      detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body);
-    } catch {
-      /* response can be plain text */
+  const request = async (): Promise<T> => {
+    const response = await fetch('/api' + path, { ...init, headers, signal: controller.signal });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        const body = await response.json();
+        detail =
+          typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body);
+      } catch {
+        /* response can be plain text */
+      }
+      throw new Error(detail || `Studio request failed (${response.status})`);
     }
-    throw new Error(detail);
+    return response.json() as Promise<T>;
+  };
+  try {
+    // Bound the complete response, including its JSON body. Racing cancellation
+    // also keeps the UI recoverable if a browser fetch implementation stalls.
+    return await Promise.race([request(), cancellation]);
+  } finally {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener('abort', cancel);
+    controller.signal.removeEventListener('abort', aborted);
   }
-  return response.json() as Promise<T>;
 }
 export const post = <T>(path: string, body: unknown) =>
   api<T>(path, { method: 'POST', body: JSON.stringify(body) });

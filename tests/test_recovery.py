@@ -330,3 +330,220 @@ async def test_saved_runs_without_date_remain_readable():
         assert restored.view()["date"] is None and restored.task is None
     finally:
         await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_saved_run_gets_share_listener_and_control_state(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    saved = session.view()
+    host.sessions.clear()
+    host.journal.events.return_value = []
+    reads = 0
+
+    async def delayed_read(sid):
+        nonlocal reads
+        reads += 1
+        await asyncio.sleep(0)
+        return saved
+
+    monkeypatch.setattr(host.journal, "get", delayed_read)
+    try:
+        http_view, socket_view = await asyncio.gather(host.get(session.id), host.get(session.id))
+        assert http_view is socket_view and reads == 1
+        socket_view.listeners["connected-browser"] = asyncio.Queue()
+        assert "connected-browser" in http_view.listeners
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_baseline_seeds_context_before_slow_source_persistence(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    session.config.mode = "live"
+    plays = [play.model_copy(update={"source": "espn"}) for play in session.replay[:8]]
+    writing = asyncio.Event()
+    release = asyncio.Event()
+    original_append = host.journal.append
+
+    async def source_write(event):
+        if event.type == "source.event" and not writing.is_set():
+            writing.set()
+            await release.wait()
+        await original_append(event)
+
+    monkeypatch.setattr(host.journal, "append", source_write)
+    monkeypatch.setattr(host.provider, "events", AsyncMock(return_value=plays))
+    poller = asyncio.create_task(host.live_poll(session))
+    try:
+        await writing.wait()
+        assert session.pending[-1].id == plays[-1].id
+        assert len(session.seen) == len(plays)
+        session.cancel.set()
+        release.set()
+        poller.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poller
+        snapshot = await host.make_snapshot({"session_id": session.id, "epoch": session.epoch,
+                                             "play": plays[-1].model_dump()})
+        assert [item["id"] for item in snapshot["snapshot"]["drive_history"]] == [play.id for play in plays[2:7]]
+    finally:
+        release.set()
+        if not poller.done():
+            poller.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poller
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_late_live_poll_response_cannot_repopulate_paused_session(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    session.config.mode = "live"
+    play = session.replay[4].model_copy(update={"source": "espn"})
+    requested = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_feed(game_id):
+        requested.set()
+        await release.wait()
+        return [play]
+
+    monkeypatch.setattr(host.provider, "events", delayed_feed)
+    poller = asyncio.create_task(host.live_poll(session))
+    try:
+        await requested.wait()
+        await host.halt(session)
+        before = session.seq
+        release.set()
+        await poller
+        assert session.seq == before and not session.seen and not session.pending
+        assert session.status == "paused"
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_old_live_correction_does_not_receive_later_commentary(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    session.config.mode = "live"
+    plays = [play.model_copy(update={"source": "espn"}) for play in session.replay[:20]]
+    session.seen = {play.id: play for play in plays}
+    for index in (4, 18):
+        snapshot = GameSnapshot(event=plays[index]).seal()
+        session.turns.append(CommentaryTurn(exchange_id=str(index), agent_id="a", persona="Max", team_id="KC",
+            event_id=plays[index].id, snapshot_hash=snapshot.hash, text=f"Call from play {index}").model_dump())
+    try:
+        revised = plays[6].model_copy(update={"revision": 2, "flags": ["correction"]})
+        snapshot = await host.make_snapshot({"session_id": session.id, "epoch": session.epoch,
+                                             "play": revised.model_dump()})
+        assert [turn["text"] for turn in snapshot["snapshot"]["recent_turns"]] == ["Call from play 4"]
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_repeat_already_completed_latest_live_play(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate(voice_enabled=False))
+    session.config.mode = "live"
+    play = session.replay[4].model_copy(update={"source": "espn"})
+    monkeypatch.setattr(host.provider, "events", AsyncMock(return_value=[play]))
+    monkeypatch.setattr(host, "one", AsyncMock())
+    try:
+        await host.control(session, "step")
+        await asyncio.wait_for(session.task, 2)
+        assert session.commented_revisions[play.id] == play.revision
+        await host.halt(session)
+        session.cancel = asyncio.Event()
+
+        async def same_feed(game_id):
+            session.cancel.set()
+            return [play]
+
+        monkeypatch.setattr(host.provider, "events", same_feed)
+        original_sleep = asyncio.sleep
+
+        async def no_wait(seconds):
+            await original_sleep(0)
+
+        monkeypatch.setattr("backend.engine.asyncio.sleep", no_wait)
+        await host.live_poll(session)
+        assert not session.pending
+        assert host.one.await_count == 1
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_final_live_game_finishes_after_latest_play_instead_of_polling_forever(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate(voice_enabled=False))
+    session.config.mode = "live"
+    play = session.replay[-1].model_copy(update={"source": "espn"})
+    host.provider._games[session.game.id] = session.game.model_copy(update={"mode": "live", "status": "final"})
+    monkeypatch.setattr(host.provider, "events", AsyncMock(return_value=[play]))
+    monkeypatch.setattr(host, "one", AsyncMock())
+    original_sleep = asyncio.sleep
+
+    async def no_wait(seconds):
+        await original_sleep(0)
+
+    monkeypatch.setattr("backend.engine.asyncio.sleep", no_wait)
+    try:
+        await host.control(session, "play")
+        await asyncio.wait_for(session.task, 2)
+        assert session.status == "completed" and host.one.await_count == 1
+        assert session.feed["game_status"] == "final"
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_last_replay_single_step_completes_and_remains_complete_after_reopen(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate(start_index=177, voice_enabled=False))
+    monkeypatch.setattr(host, "one", AsyncMock())
+    try:
+        await host.control(session, "step")
+        await session.task
+        assert session.status == "completed" and session.index == session.game.play_count
+        await host.close()
+        saved = host.journal.save.call_args.args[0]
+        assert saved["status"] == "completed"
+        host.journal.get.return_value = saved
+        host.journal.events.return_value = []
+        host.sessions.clear()
+        restored = await host.get(session.id)
+        assert restored.status == "completed" and restored.task is None
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_consumes_spoken_live_revision_but_keeps_unspoken_correction():
+    host = engine()
+    session = await host.create(SessionCreate(voice_enabled=False))
+    session.config.mode = "live"
+    saved = session.view()
+    play = session.replay[4].model_copy(update={"source": "espn"})
+    spoken = GameSnapshot(event=play).seal()
+    correction = GameSnapshot(event=play.model_copy(update={"revision": 2, "flags": ["correction"]})).seal()
+    turn = CommentaryTurn(exchange_id="crashed", agent_id="a", persona="Max", team_id="KC",
+        event_id=play.id, snapshot_hash=spoken.hash, text="A recorded live call.")
+    records = [("snapshot", {"snapshot": spoken.model_dump()}), ("turn", {"turn": turn.model_dump()}),
+               ("snapshot", {"snapshot": correction.model_dump()})]
+    host.journal.get.return_value = saved
+    host.journal.events.return_value = [RunEvent(seq=saved["seq"] + index + 1, session_id=session.id,
+        epoch=session.epoch, type=kind, data=data).model_dump() for index, (kind, data) in enumerate(records)]
+    host.sessions.clear()
+    try:
+        restored = await host.get(session.id)
+        assert restored.commented_revisions[play.id] == 1
+        assert restored.snapshot["event"]["revision"] == 2
+        assert restored.task is None and len(restored.turns) == 1
+    finally:
+        await host.provider.aclose()

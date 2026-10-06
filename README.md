@@ -37,10 +37,14 @@ Then open **http://localhost:8000**. API documentation is at http://localhost:80
 1. Keep **Historical replay** and **Demo commentary** selected. No credentials or live game are needed.
 2. Select Baltimore at Kansas City (September 5, 2024). The studio starts at its opening offensive play, skipping the pregame marker.
 3. Use **Advance one play** to process a play, then open the debugger. Both agents receive the same snapshot hash; the lead makes a direct A2A request to its peer. The workflow strip shows each completed stage.
-4. Advance again to see the other agent take the lead, or press **Start broadcast** for a paced replay. **Jump into the action** selects a touchdown, turnover, field goal or review without revealing the final result. Press Start or Advance after selecting a moment. Restart returns to that run's chosen starting play.
-5. Turn on speech after interacting with the page. Demo speech uses the browser's available voices; quality and voice availability depend on the device. Muting preserves the written conversation.
+4. Advance again to see the other agent take the lead, or press **Start broadcast** for a paced replay. **Instant replay** calls a real touchdown, turnover, field goal or review immediately with one click. It opens a new run at that play, generates both reactions, then pauses. Restart returns to that run's chosen starting play.
+5. Turn on speech using the speaker control beside Start or **Voice off** in the booth. Demo speech uses the browser's available voices; quality and voice availability depend on the device. Muting preserves the written conversation.
 6. Inspect prompts, outputs, protocol tasks, event facts, errors, and timings. Export the run JSON for investigation.
 7. Pause, restart, switch games, or reopen a saved run. Saved history is displayed without automatically regenerating or speaking old turns.
+
+Each call/reply pair has its own quarter, clock, score, and expandable source play. Field context is labelled as the situation at the snap for nflverse replay; replay scores are post-play. Reading older exchanges stops automatic scrolling; **Back to the latest exchange** resumes it. Download a readable transcript from the conversation footer, or export the full trace from the debugger.
+
+Keyboard shortcuts work when focus is outside buttons and inputs: **Space** plays/pauses, **Right arrow** advances one play, **M** toggles speech, and **D** toggles the debugger. The studio checks both agent services and disables starting if either is offline. An initial API failure offers **Retry connection**.
 
 The replay uses real nflverse plays. Demo commentary is deterministic, event-grounded dialogue through the same LangGraph and A2A services as OpenAI mode. It demonstrates the application workflow; model-driven naturalness requires the credentialed review below.
 
@@ -56,13 +60,15 @@ OPENAI_VOICE_MODEL=gpt-live-1
 
 Select **OpenAI commentary** in the dashboard. The text model prepares short factual calls and replies. Your requested `gpt-live-1` delivers the spoken commentary through the server. Keys stay on the Python services.
 
-Personas are editable manifests under `personas/`. Max supports the home team; Riley supports the away team. The personalities use original identities and distinct stock voices.
+Personas are editable manifests under `personas/`. Max supports the home team; Riley supports the away team. The personalities use original identities and distinct stock voices. Validated `demo_delivery` settings control offline pace (`punchy` or `measured`), an ordered `analysis_focus` list (`situation`, `field_position`, `recent_sequence`, `score`), and `banter_frequency` from 0 to 0.6. Restart the Python services after editing manifests.
 
 GPT-Live uses fresh sessions for bounded utterances. The next agent receives the lead's finalized observed speech transcript. The browser serializes audio segments and acknowledges playback. Caption timing is approximate, and streamed speech may paraphrase a draft. Once credentials are configured, listen to representative scoring, turnover, penalty, reversed-play and quiet-period examples before presenting model-driven broadcast quality.
 
 ## Live games
 
 Select **Live ESPN** to load the current scoreboard. Pick a game and start the booth. The adapter polls scores every 15 seconds and selected-game play-by-play every 5 seconds, deduplicates IDs, and notices revised plays. Joining a game starts from its current context and latest play.
+
+The default scoreboard date follows NFL Eastern time, including games still running after midnight in Europe. Scheduled games with no plays remain connected and waiting. A verified final game finishes after queued commentary; resuming avoids repeating an already-commented play while still accepting new revisions.
 
 ESPN's endpoints are unofficial and best effort. The UI reports connection health, last successful poll, and provider errors. Halftime and a quiet field do not mean the feed disconnected. A failed live connection stays visibly failed; changing to historical replay is explicit.
 
@@ -83,7 +89,7 @@ npm.cmd run test:browser
 
 Backend checks cover causal scores, reversed rulings, provider deduplication/corrections, shared snapshots, protocol exchanges, cancellation, and speech boundaries. Credential-free CI exercises the demo and protocol contracts. Live provider availability and actual OpenAI speech require explicit smoke checks.
 
-The browser checks use a fresh, isolated headless Chromium profile against the running services on port 8000. They verify desktop and mobile layout, the 32 team icons, actual A2A lead alternation, the debugger, restart, highlights, keyboard navigation, failed session creation/regeneration and stale polling. GitHub Actions also runs the services, HTTP smoke check and complete browser suite after a fresh Linux checkout.
+The browser checks use a fresh, isolated headless Chromium profile against the running services on port 8000. They verify desktop and mobile layout, the 32 team icons, actual A2A lead alternation, the debugger, restart, one-click highlights, transcript downloads, service recovery, keyboard navigation, failed transitions, saved runs and stale polling. GitHub Actions also runs the services, HTTP smoke check and complete browser suite after a fresh Linux checkout.
 
 Frontend source is formatted for easier maintenance. Use `npm.cmd run format` in `frontend` after edits; CI checks formatting.
 

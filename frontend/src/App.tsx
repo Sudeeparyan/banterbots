@@ -36,6 +36,7 @@ import { api, post } from './types';
 import type { Config, Feed, Game, RunEvent, SavedRun, Session, Team, Turn } from './types';
 import { mergeSessionView, reduceEvent } from './session';
 import { BroadcastAudio } from './audio';
+import { exchangesFor, nflDate, transcriptFor } from './broadcast';
 
 const asText = (value: unknown) =>
   typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -54,13 +55,6 @@ const ordinal = (value: number | null | undefined) =>
   value == null
     ? '—'
     : `${value}${value === 1 ? 'st' : value === 2 ? 'nd' : value === 3 ? 'rd' : 'th'}`;
-const localDate = () =>
-  new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Europe/Dublin',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date());
 const gameDate = (value: string) =>
   new Date(value).toLocaleDateString('en-GB', {
     timeZone: 'America/New_York',
@@ -121,7 +115,7 @@ function App() {
     [provider, setProvider] = useState<'demo' | 'openai'>('demo');
   const [selectedTeam, setSelectedTeam] = useState<string | null>(null),
     [selectedGame, setSelectedGame] = useState('2024_01_BAL_KC');
-  const [date, setDate] = useState(localDate()),
+  const [date, setDate] = useState(nflDate()),
     [feed, setFeed] = useState<Feed>({ status: 'connecting' });
   const [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false),
@@ -141,8 +135,16 @@ function App() {
   const [highlights, setHighlights] = useState<Highlight[]>([]),
     [startingHighlight, setStartingHighlight] = useState(false),
     [now, setNow] = useState(Date.now());
+  const [following, setFollowing] = useState(true),
+    [health, setHealth] = useState<{ a: boolean; b: boolean } | null>(null),
+    [connectionAttempt, setConnectionAttempt] = useState(0);
+  const followingRef = useRef(true);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
   const teamRail = useRef<HTMLDivElement | null>(null);
   const feedRequest = useRef(0);
+  const controlPending = useRef(false);
+  const openPending = useRef(false);
+  const sessionRequest = useRef(0);
   const socket = useRef<WebSocket | null>(null),
     seq = useRef(0),
     epoch = useRef(0),
@@ -152,17 +154,27 @@ function App() {
   const transcriptEnd = useRef<HTMLDivElement | null>(null),
     audioRef = useRef<BroadcastAudio | null>(null);
   if (!audioRef.current)
-    audioRef.current = new BroadcastAudio(setSpeaking, (id, samples, cancelled) => {
-      if (socket.current?.readyState === WebSocket.OPEN)
-        socket.current.send(
-          JSON.stringify({
-            type: 'playback.ack',
-            segment_id: id,
-            played_samples: samples,
-            cancelled,
-          }),
-        );
-    });
+    audioRef.current = new BroadcastAudio(
+      setSpeaking,
+      (id, samples, cancelled) => {
+        if (socket.current?.readyState === WebSocket.OPEN)
+          socket.current.send(
+            JSON.stringify({
+              type: 'playback.ack',
+              segment_id: id,
+              played_samples: samples,
+              cancelled,
+            }),
+          );
+      },
+      (message, audioMuted) => {
+        setError(message);
+        if (audioMuted) {
+          mutedRef.current = true;
+          setMuted(true);
+        }
+      },
+    );
   const findTeam = useCallback(
     (id?: string | null) => teams.find((t) => t.id === id || t.abbreviation === id),
     [teams],
@@ -180,6 +192,28 @@ function App() {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
+  useEffect(() => {
+    let alive = true;
+    let pending = false;
+    const poll = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const result = await api<{ agents: { a: boolean; b: boolean } }>('/health');
+        if (alive) setHealth(result.agents);
+      } catch {
+        if (alive) setHealth({ a: false, b: false });
+      } finally {
+        pending = false;
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 10000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [connectionAttempt]);
   useEffect(() => {
     if (mode !== 'replay') {
       setHighlights([]);
@@ -264,6 +298,9 @@ function App() {
       startIndex?: number,
       currentDate = date,
     ) => {
+      if (openPending.current) return null;
+      openPending.current = true;
+      const request = ++sessionRequest.current;
       const wasSaved = savedRef.current;
       setBusy(true);
       setError('');
@@ -293,6 +330,7 @@ function App() {
           start_index: position,
           ...(currentMode === 'live' ? { date: currentDate.replaceAll('-', '') } : {}),
         });
+        if (request !== sessionRequest.current) return null;
         setReadingSaved(false);
         savedRef.current = false;
         if (socket.current) {
@@ -307,10 +345,15 @@ function App() {
         setSession(next);
         sessionRef.current = next;
         setSelectedGame(gameId);
+        followingRef.current = true;
+        setFollowing(true);
         void loadSaved();
+        return next;
       } catch (e) {
         setError((e as Error).message);
+        return null;
       } finally {
+        openPending.current = false;
         setBusy(false);
       }
     },
@@ -318,6 +361,7 @@ function App() {
   );
   useEffect(() => {
     let alive = true;
+    setLoading(true);
     void (async () => {
       try {
         const [teamList, configuration, gameList] = await Promise.all([
@@ -345,7 +389,7 @@ function App() {
     return () => {
       alive = false;
     };
-  }, []); // Start one local broadcast per page load.
+  }, [connectionAttempt]); // Explicit retry also recovers an initially unavailable API.
 
   useEffect(() => {
     if (!session?.id || readingSaved) {
@@ -354,6 +398,7 @@ function App() {
     }
     let disposed = false,
       retry: ReturnType<typeof setTimeout>;
+    let ownedSocket: WebSocket | null = null;
     const id = session.id;
     const connect = () => {
       if (disposed) return;
@@ -361,10 +406,13 @@ function App() {
         `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/sessions/${id}/stream?since=${seq.current}`,
       );
       socket.current = ws;
+      ownedSocket = ws;
       ws.onopen = () => {
+        if (disposed || socket.current !== ws) return;
         setConnected(true);
       };
       ws.onmessage = (event) => {
+        if (disposed || socket.current !== ws || sessionRef.current?.id !== id) return;
         let item: RunEvent;
         try {
           item = JSON.parse(event.data);
@@ -427,40 +475,59 @@ function App() {
           setError(asText(item.data.message ?? item.data.error ?? item.data));
       };
       ws.onclose = () => {
+        if (disposed || socket.current !== ws) return;
         setConnected(false);
         audioRef.current?.clear();
         setCaptions({});
         if (!disposed) retry = setTimeout(connect, 1200);
       };
-      ws.onerror = () => ws.close();
+      ws.onerror = () => {
+        if (!disposed && socket.current === ws) ws.close();
+      };
     };
     connect();
     return () => {
       disposed = true;
       clearTimeout(retry);
-      audioRef.current?.clear();
-      socket.current?.close();
+      if (socket.current === ownedSocket) {
+        audioRef.current?.clear();
+        socket.current = null;
+      }
+      if (ownedSocket) {
+        ownedSocket.onopen = null;
+        ownedSocket.onmessage = null;
+        ownedSocket.onclose = null;
+        ownedSocket.onerror = null;
+        ownedSocket.close();
+      }
     };
   }, [session?.id, readingSaved]);
 
   useEffect(() => {
-    if (mode !== 'live') return;
+    if (mode !== 'live' || readingSaved) return;
     const poll = setInterval(() => {
       void loadGames(mode, date).catch(() => {});
     }, 15000);
     return () => clearInterval(poll);
-  }, [mode, date, loadGames]);
+  }, [mode, date, loadGames, readingSaved]);
   useEffect(() => {
-    const viewport = transcriptEnd.current?.parentElement;
-    if (viewport) viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' });
+    const viewport = conversationRef.current;
+    if (viewport && followingRef.current)
+      viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'instant' });
   }, [
     session?.turns.length,
+    debug,
     Object.values(captions)
       .map((c) => c.text)
       .join(''),
   ]);
   const control = async (action: string, speed?: number) => {
-    if (!session || busy || readingSaved || startingHighlight) return;
+    if (!session || busy || controlPending.current || readingSaved || startingHighlight) return;
+    if (['play', 'step'].includes(action) && (!connected || (health && (!health.a || !health.b)))) {
+      setError('The studio and both commentators must be connected before starting.');
+      return;
+    }
+    controlPending.current = true;
     setBusy(true);
     setError('');
     if (['pause', 'restart', 'stop'].includes(action)) audioRef.current?.clear();
@@ -470,6 +537,7 @@ function App() {
         action,
         ...(speed ? { speed } : {}),
       });
+      if (sessionRef.current?.id !== next.id) return;
       if (next.epoch > epoch.current) {
         epoch.current = next.epoch;
         audioRef.current?.clear();
@@ -479,22 +547,29 @@ function App() {
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      controlPending.current = false;
       setBusy(false);
     }
   };
   const changeMode = async (next: 'replay' | 'live') => {
+    if (busy || startingHighlight || loading || openPending.current) return;
     if (next === mode && !readingSaved) return;
     feedRequest.current++;
     setBusy(true);
-    setMode(next);
     setError('');
-    setSelectedTeam(null);
     audioRef.current?.clear();
     setCaptions({});
     try {
       if (session && !readingSaved)
         await post(`/sessions/${session.id}/control`, { action: 'stop' });
+      setMode(next);
+      setReadingSaved(false);
+      savedRef.current = false;
+      setSelectedTeam(null);
       setSession(null);
+      sessionRef.current = null;
+      setGames([]);
+      setFeed({ status: 'connecting' });
       const list = await loadGames(next, date);
       if (list.length) await openSession(list[0].id, next, provider);
     } catch (e) {
@@ -504,8 +579,9 @@ function App() {
     }
   };
   const changeDate = async (next: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(next)) return;
+    if (busy || startingHighlight || openPending.current) return;
     feedRequest.current++;
-    setDate(next);
     setBusy(true);
     setError('');
     audioRef.current?.clear();
@@ -513,7 +589,13 @@ function App() {
     try {
       if (session && !readingSaved)
         await post(`/sessions/${session.id}/control`, { action: 'stop' });
+      setDate(next);
+      setReadingSaved(false);
+      savedRef.current = false;
       setSession(null);
+      sessionRef.current = null;
+      setGames([]);
+      setFeed({ status: 'connecting' });
       const list = await loadGames('live', next);
       if (list.length) await openSession(list[0].id, 'live', provider, 0, next);
     } catch (e) {
@@ -523,8 +605,11 @@ function App() {
     }
   };
   const changeProvider = async (next: 'demo' | 'openai') => {
-    setProvider(next);
-    if (session) await openSession(selectedGame, mode, next);
+    if (busy || startingHighlight || openPending.current) return;
+    if (session) {
+      const opened = await openSession(selectedGame, mode, next);
+      if (opened) setProvider(next);
+    } else setProvider(next);
   };
   const toggleVoice = async () => {
     const next = !muted;
@@ -541,19 +626,30 @@ function App() {
     }
   };
   const viewSaved = async (id: string) => {
+    if (busy || startingHighlight || openPending.current) return;
+    const request = ++sessionRequest.current;
     setBusy(true);
+    setError('');
     audioRef.current?.clear();
     try {
       if (session && !readingSaved)
         await post(`/sessions/${session.id}/control`, { action: 'pause' });
       const next = await api<Session>(`/sessions/${id}`);
+      if (request !== sessionRequest.current) return;
+      feedRequest.current++;
       setSession(next);
       sessionRef.current = next;
+      setCaptions({});
       setReadingSaved(true);
       setHistoryOpen(false);
       setSelectedGame(next.game.id);
       setMode(next.mode);
       setProvider(next.provider);
+      setGames([next.game]);
+      setFeed(next.feed);
+      setSelectedTeam(null);
+      followingRef.current = true;
+      setFollowing(true);
       if (next.date)
         setDate(`${next.date.slice(0, 4)}-${next.date.slice(4, 6)}-${next.date.slice(6, 8)}`);
     } catch (e) {
@@ -566,11 +662,68 @@ function App() {
     if (busy || startingHighlight) return;
     setStartingHighlight(true);
     try {
-      await openSession(selectedGame, 'replay', provider, item.index);
+      const next = await openSession(selectedGame, 'replay', provider, item.index);
+      if (next) {
+        if (!muted) await audioRef.current?.unlock();
+        const result = await post<Session>(`/sessions/${next.id}/control`, { action: 'step' });
+        if (sessionRef.current?.id !== result.id) return;
+        setSession((current) => mergeSessionView(current, result));
+      }
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setStartingHighlight(false);
     }
   };
+  const followLatest = () => {
+    followingRef.current = true;
+    setFollowing(true);
+    const viewport = conversationRef.current;
+    viewport?.scrollTo({ top: viewport.scrollHeight, behavior: 'instant' });
+  };
+  const downloadTranscript = () => {
+    if (!session) return;
+    const url = URL.createObjectURL(
+      new Blob([transcriptFor(session)], { type: 'text/plain;charset=utf-8' }),
+    );
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `banterbots-${session.game.away_team}-${session.game.home_team}-${session.id.slice(0, 8)}.txt`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        help ||
+        historyOpen ||
+        e.altKey ||
+        e.ctrlKey ||
+        e.metaKey ||
+        target.isContentEditable ||
+        target.closest('input,select,textarea,button,a')
+      )
+        return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        void control(session?.status === 'playing' ? 'pause' : 'play');
+      }
+      if (
+        e.code === 'ArrowRight' &&
+        session?.status !== 'playing' &&
+        session?.status !== 'stepping'
+      ) {
+        e.preventDefault();
+        void control('step');
+      }
+      if (e.key.toLowerCase() === 'm') void toggleVoice();
+      if (e.key.toLowerCase() === 'd') setDebug((current) => !current);
+    };
+    document.addEventListener('keydown', key);
+    return () => document.removeEventListener('keydown', key);
+  });
 
   const game = session?.game ?? games.find((g) => g.id === selectedGame),
     snapshot = session?.snapshot,
@@ -592,6 +745,8 @@ function App() {
     .reverse();
   const turns = session?.turns ?? [],
     traceEvents = (session?.events ?? []).filter((e) => !['audio'].includes(e.type));
+  const exchanges = exchangesFor(session);
+  const agentUnavailable = health && (!health.a || !health.b);
   const selectedTrace =
     traceEvents.find((e) => e.seq === traceSelected) ?? traceEvents[traceEvents.length - 1];
   const sourceFeed = session?.feed ?? feed,
@@ -727,18 +882,26 @@ function App() {
               key={item.id}
               className={`mini-game ${selectedGame === item.id ? 'selected' : ''}`}
               onClick={() => void openSession(item.id, mode, provider)}
-              disabled={busy}
+              disabled={busy || startingHighlight || readingSaved}
             >
               <span className="mini-teams">
                 <span>
                   <Logo team={findTeam(item.away_team)} size={21} />
                   <b>{item.away_team}</b>
-                  <strong>{item.away_score}</strong>
+                  <strong>
+                    {mode === 'replay' && session?.game.id === item.id
+                      ? (event?.away_score ?? item.away_score)
+                      : item.away_score}
+                  </strong>
                 </span>
                 <span>
                   <Logo team={findTeam(item.home_team)} size={21} />
                   <b>{item.home_team}</b>
-                  <strong>{item.home_score}</strong>
+                  <strong>
+                    {mode === 'replay' && session?.game.id === item.id
+                      ? (event?.home_score ?? item.home_score)
+                      : item.home_score}
+                  </strong>
                 </span>
               </span>
               <span className="mini-status">
@@ -767,23 +930,23 @@ function App() {
               <span /> TWO SIDES. ONE GAME.
             </div>
             <h1>
-              Game day. <em>Two ways.</em>
+              The broadcast <em>booth.</em>
             </h1>
-            <p>One shared feed. Two rival voices. Every play gets a response.</p>
+            <p>Real football. Rival loyalties. A conversation on every play.</p>
           </div>
           <div className="page-actions">
             <div className="mode-switch" aria-label="Feed mode">
               <button
                 className={mode === 'replay' ? 'active' : ''}
                 onClick={() => void changeMode('replay')}
-                disabled={busy}
+                disabled={busy || startingHighlight || loading}
               >
                 <History size={14} /> Replay
               </button>
               <button
                 className={mode === 'live' ? 'active' : ''}
                 onClick={() => void changeMode('live')}
-                disabled={busy}
+                disabled={busy || startingHighlight || loading}
               >
                 <Radio size={14} /> Live feed
               </button>
@@ -813,11 +976,34 @@ function App() {
             play-by-play…
           </div>
         )}
+        {!loading && !session && mode === 'replay' && (
+          <div className="recovery-banner">
+            <WifiOff size={17} /> The studio is unavailable.
+            <button disabled={busy} onClick={() => setConnectionAttempt((value) => value + 1)}>
+              Retry connection
+            </button>
+          </div>
+        )}
+        {agentUnavailable && !readingSaved && (
+          <div className="recovery-banner" role="status">
+            <Activity size={16} />
+            {!health.a && !health.b
+              ? 'Both commentators are offline.'
+              : `${!health.a ? 'Max' : 'Riley'} is offline.`}
+            <span>
+              Start all three Python services with tools/dev.py. The studio checks again
+              automatically.
+            </span>
+          </div>
+        )}
         {readingSaved && (
           <div className="saved-banner">
             <History size={16} />
             <span>Recorded run • Playback is silent. This view shows the original results.</span>
-            <button onClick={() => void openSession(selectedGame, mode, provider)}>
+            <button
+              disabled={busy || startingHighlight}
+              onClick={() => void openSession(selectedGame, mode, provider)}
+            >
               Regenerate as a new run <ArrowRight size={14} />
             </button>
           </div>
@@ -841,14 +1027,14 @@ function App() {
             <div className="moment-title">
               <Sparkles size={17} />
               <span>
-                JUMP INTO THE ACTION<small>Pick a real play, then start the booth.</small>
+                INSTANT REPLAY<small>One click. One real play. Two reactions.</small>
               </span>
             </div>
             <div className="moment-list">
               {highlights.map((item) => (
                 <button
                   key={item.id}
-                  disabled={busy || startingHighlight}
+                  disabled={busy || startingHighlight || Boolean(agentUnavailable)}
                   className={snapshot?.event.id === item.id ? 'selected' : ''}
                   onClick={() => void startHighlight(item)}
                 >
@@ -879,7 +1065,7 @@ function App() {
                 <select
                   id="game"
                   value={selectedGame}
-                  disabled={busy || !selectorGames.length}
+                  disabled={busy || startingHighlight || readingSaved || !selectorGames.length}
                   onChange={(e) => void openSession(e.target.value, mode, provider)}
                 >
                   {selectorGames.map((g) => (
@@ -896,7 +1082,7 @@ function App() {
                     aria-label="Live games date"
                     type="date"
                     value={date}
-                    disabled={busy}
+                    disabled={busy || startingHighlight || readingSaved}
                     onChange={(e) => void changeDate(e.target.value)}
                   />
                 )}
@@ -927,7 +1113,9 @@ function App() {
                     </div>
                     <span className="matchup-state">
                       {session?.status === 'completed'
-                        ? 'REPLAY COMPLETE'
+                        ? mode === 'live'
+                          ? 'GAME FINAL'
+                          : 'REPLAY COMPLETE'
                         : playing
                           ? 'ON AIR'
                           : readingSaved
@@ -946,6 +1134,13 @@ function App() {
                   </div>
                 </div>
                 <div className="field-context">
+                  <span className="fact-timing">
+                    {event
+                      ? event.source === 'nflverse'
+                        ? 'SITUATION AT THE SNAP'
+                        : 'LATEST FIELD SITUATION'
+                      : 'FIELD CONTEXT'}
+                  </span>
                   <div className="game-facts">
                     <div>
                       <span>POSSESSION</span>
@@ -1002,9 +1197,24 @@ function App() {
               </div>
               <div className="transport">
                 <button
+                  className="icon-button outlined transport-voice"
+                  onClick={() => void toggleVoice()}
+                  aria-label={muted ? 'Enable commentary voice' : 'Mute commentary voice'}
+                  title={muted ? 'Enable commentary voice (M)' : 'Mute commentary voice (M)'}
+                  aria-pressed={!muted}
+                >
+                  {muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+                </button>
+                <button
                   className={`play-button ${playing ? 'is-playing' : ''}`}
                   disabled={
-                    busy || !session || readingSaved || stepping || session.status === 'completed'
+                    busy ||
+                    startingHighlight ||
+                    !session ||
+                    readingSaved ||
+                    stepping ||
+                    (!playing && (Boolean(agentUnavailable) || !connected)) ||
+                    session.status === 'completed'
                   }
                   onClick={() => void control(playing ? 'pause' : 'play')}
                 >
@@ -1025,10 +1235,13 @@ function App() {
                   className="icon-button outlined"
                   disabled={
                     busy ||
+                    startingHighlight ||
                     !session ||
                     readingSaved ||
                     playing ||
                     stepping ||
+                    !connected ||
+                    Boolean(agentUnavailable) ||
                     session.status === 'completed'
                   }
                   onClick={() => void control('step')}
@@ -1039,7 +1252,7 @@ function App() {
                 </button>
                 <button
                   className="icon-button outlined"
-                  disabled={busy || !session || readingSaved}
+                  disabled={busy || startingHighlight || !session || readingSaved}
                   onClick={() => void control('restart')}
                   aria-label="Restart game"
                   title="Restart game"
@@ -1053,7 +1266,7 @@ function App() {
                       <select
                         aria-label="Replay speed"
                         value={session?.speed ?? 2}
-                        disabled={busy || readingSaved}
+                        disabled={busy || startingHighlight || readingSaved}
                         onChange={(e) => void control('speed', Number(e.target.value))}
                       >
                         <option value={0.5}>0.5×</option>
@@ -1165,7 +1378,7 @@ function App() {
                         </div>
                         <span className="agent-badge">
                           AGENT {agent.toUpperCase()}
-                          <i />
+                          <i className={health?.[agent] === false ? 'agent-offline' : ''} />
                         </span>
                       </div>
                       <h3>{persona?.name ?? (i === 0 ? 'Max Carter' : 'Riley Brooks')}</h3>
@@ -1191,9 +1404,11 @@ function App() {
                             ? 'SPEAKING'
                             : Object.values(captions).some((c) => c.agent_id === agent)
                               ? 'PREPARING CALL'
-                              : last
-                                ? 'CALL COMPLETE'
-                                : 'READY'}
+                              : health && !health[agent]
+                                ? 'OFFLINE'
+                                : last
+                                  ? 'CALL COMPLETE'
+                                  : 'READY'}
                         </span>
                       </div>
                     </div>
@@ -1238,48 +1453,101 @@ function App() {
                 </span>
                 <strong>{turns.filter((turn) => turn.reply_to_turn_id).length} exchanges</strong>
               </div>
+              {!following && (
+                <button className="follow-latest" onClick={followLatest}>
+                  <ArrowDown size={13} /> Back to the latest exchange
+                </button>
+              )}
               <div
                 className="conversation"
+                ref={conversationRef}
+                onScroll={(e) => {
+                  const element = e.currentTarget;
+                  const nearBottom =
+                    element.scrollHeight - element.scrollTop - element.clientHeight < 56;
+                  followingRef.current = nearBottom;
+                  setFollowing(nearBottom);
+                }}
                 aria-live="polite"
                 aria-label="Agent commentary transcript"
               >
                 {turns.length
-                  ? turns.map((turn, i) => (
-                      <article
-                        className={`commentary-turn agent-${turn.agent_id} ${speaking === turn.agent_id && i === turns.length - 1 ? 'talking' : ''}`}
-                        key={turn.id}
-                        style={teamColor(findTeam(turn.team_id))}
+                  ? exchanges.map((exchange, i) => (
+                      <section
+                        className={`exchange-group ${i === exchanges.length - 1 ? 'latest-exchange' : ''}`}
+                        key={exchange.id}
+                        aria-label={`Exchange ${i + 1}`}
                       >
-                        <div className="turn-avatar">{turn.agent_id === 'a' ? 'M' : 'R'}</div>
-                        <div className="turn-body">
-                          <div className="turn-meta">
-                            <strong>{turn.persona}</strong>
-                            <span className="turn-team">{turn.team_id}</span>
-                            <span className="turn-kind">
-                              {turn.reply_to_turn_id ? (
-                                <>
-                                  <ArrowDown size={10} /> REPLY
-                                </>
-                              ) : (
-                                'CALL'
-                              )}
+                        <div className="exchange-context">
+                          <span className="exchange-number">{String(i + 1).padStart(2, '0')}</span>
+                          <strong>
+                            {exchange.snapshot
+                              ? `Q${exchange.snapshot.event.quarter} · ${exchange.snapshot.event.clock}`
+                              : `Play ${exchange.turns[0].event_id.split('_').pop()}`}
+                          </strong>
+                          <span className="exchange-play-type">
+                            {exchange.snapshot?.event.play_type.replaceAll('_', ' ') ??
+                              'Shared play'}
+                          </span>
+                          {exchange.snapshot && (
+                            <span className="exchange-score">
+                              {exchange.snapshot.event.away_team}{' '}
+                              {exchange.snapshot.event.away_score} –{' '}
+                              {exchange.snapshot.event.home_score}{' '}
+                              {exchange.snapshot.event.home_team}
                             </span>
-                            <time>{time(turn.created_at)}</time>
-                          </div>
-                          <p>
-                            {turn.mode === 'openai' ? (turn.spoken_text ?? turn.text) : turn.text}
-                          </p>
-                          <div className={`turn-proof ${debug ? 'show-proof' : ''}`}>
-                            <Check size={11} />
-                            <span>
-                              Play {turn.event_id.split('_').pop()} · snapshot{' '}
-                              {turn.snapshot_hash.slice(0, 8)}
-                            </span>
-                          </div>
+                          )}
                         </div>
-                      </article>
+                        {exchange.snapshot && (
+                          <details className="exchange-facts">
+                            <summary>
+                              <Layers size={12} /> Shared play <ChevronDown size={12} />
+                            </summary>
+                            <p>{exchange.snapshot.event.description}</p>
+                          </details>
+                        )}
+                        {exchange.turns.map((turn) => (
+                          <article
+                            className={`commentary-turn agent-${turn.agent_id} ${speaking === turn.agent_id && turn.id === (turn.agent_id === 'a' ? lastA : lastB)?.id ? 'talking' : ''}`}
+                            key={turn.id}
+                            style={teamColor(findTeam(turn.team_id))}
+                          >
+                            <div className="turn-avatar">
+                              <Logo team={findTeam(turn.team_id)} size={24} />
+                            </div>
+                            <div className="turn-body">
+                              <div className="turn-meta">
+                                <strong>{turn.persona}</strong>
+                                <span className="turn-team">{turn.team_id}</span>
+                                <span className="turn-kind">
+                                  {turn.reply_to_turn_id ? (
+                                    <>
+                                      <ArrowDown size={10} /> REPLY
+                                    </>
+                                  ) : (
+                                    'CALL'
+                                  )}
+                                </span>
+                                <time>{time(turn.created_at)}</time>
+                              </div>
+                              <p>
+                                {turn.mode === 'openai'
+                                  ? (turn.spoken_text ?? turn.text)
+                                  : turn.text}
+                              </p>
+                              <div className={`turn-proof ${debug ? 'show-proof' : ''}`}>
+                                <Check size={11} />
+                                <span>
+                                  Play {turn.event_id.split('_').pop()} · snapshot{' '}
+                                  {turn.snapshot_hash.slice(0, 8)}
+                                </span>
+                              </div>
+                            </div>
+                          </article>
+                        ))}
+                      </section>
                     ))
-                  : !Object.values(captions).some((c) => c.text) && (
+                  : !Object.keys(captions).length && (
                       <div className="conversation-empty">
                         <div className="empty-mics">
                           <div>
@@ -1292,13 +1560,21 @@ function App() {
                         </div>
                         <h3>Great rivals make great radio.</h3>
                         <p>
-                          Start from kickoff, or jump to a real game moment.
+                          Pick an instant replay above, or call the opening drive.
                           <br />
                           Max calls it. Riley has something to say.
                         </p>
                         <button
                           className="empty-start"
-                          disabled={busy || !session || readingSaved || playing || stepping}
+                          disabled={
+                            busy ||
+                            !session ||
+                            readingSaved ||
+                            playing ||
+                            stepping ||
+                            !connected ||
+                            Boolean(agentUnavailable)
+                          }
                           onClick={() => void control('step')}
                         >
                           <Play size={15} fill="currentColor" /> Call the first play
@@ -1313,26 +1589,21 @@ function App() {
                         </div>
                       </div>
                     )}
-                {Object.entries(captions)
-                  .filter(([, caption]) => caption.text)
-                  .map(([id, caption]) => (
-                    <article
-                      className={`commentary-turn agent-${caption.agent_id} talking`}
-                      key={id}
-                    >
-                      <div className="turn-avatar">{caption.agent_id === 'a' ? 'M' : 'R'}</div>
-                      <div className="turn-body">
-                        <div className="turn-meta">
-                          <strong>{caption.persona}</strong>
-                          <span className="turn-kind">ON THE MIC</span>
-                        </div>
-                        <p>
-                          {caption.text}
-                          <span className="caption-cursor" />
-                        </p>
+                {Object.entries(captions).map(([id, caption]) => (
+                  <article className={`commentary-turn agent-${caption.agent_id} talking`} key={id}>
+                    <div className="turn-avatar">{caption.agent_id === 'a' ? 'M' : 'R'}</div>
+                    <div className="turn-body">
+                      <div className="turn-meta">
+                        <strong>{caption.persona}</strong>
+                        <span className="turn-kind">ON THE MIC</span>
                       </div>
-                    </article>
-                  ))}
+                      <p>
+                        {caption.text || 'Reading the play…'}
+                        <span className="caption-cursor" />
+                      </p>
+                    </div>
+                  </article>
+                ))}
                 {playing && !speaking && (
                   <div className="thinking">
                     <i />
@@ -1355,6 +1626,13 @@ function App() {
                 <span>
                   {muted ? 'Captions only' : 'Captions + voice'} <Mic size={12} />
                 </span>
+                <button
+                  disabled={!turns.length}
+                  onClick={downloadTranscript}
+                  aria-label="Download commentary transcript"
+                >
+                  <Download size={13} /> Transcript
+                </button>
               </div>
             </section>
           </div>
@@ -1365,7 +1643,7 @@ function App() {
             <select
               aria-label="Commentary provider"
               value={provider}
-              disabled={busy || playing || readingSaved}
+              disabled={busy || startingHighlight || playing || readingSaved}
               onChange={(e) => void changeProvider(e.target.value as typeof provider)}
             >
               <option value="demo">Demo · no API key needed</option>
@@ -1564,7 +1842,7 @@ function App() {
             <a href="https://github.com/nflverse/nflverse-data" target="_blank" rel="noreferrer">
               nflverse <ExternalLink size={10} />
             </a>
-            <i>·</i> POC STUDIO v0.2
+            <i>·</i> POC STUDIO v0.3
           </span>
         </footer>
       </main>
@@ -1594,7 +1872,11 @@ function App() {
             <div className="saved-list">
               {saved.length ? (
                 saved.map((run) => (
-                  <button key={run.id} onClick={() => void viewSaved(run.id)} disabled={busy}>
+                  <button
+                    key={run.id}
+                    onClick={() => void viewSaved(run.id)}
+                    disabled={busy || startingHighlight}
+                  >
                     <div>
                       <History size={18} />
                       <span>

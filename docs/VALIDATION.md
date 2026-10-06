@@ -1,8 +1,8 @@
 # POC validation
 
-Checked locally on Windows on October 6, 2026, without OpenAI credentials.
+Checked locally on Windows on October 7, 2026, without OpenAI credentials.
 
-- Backend: **90 tests passed**, including real A2A HTTP calls in both directions,
+- Backend: **121 tests passed**, including real A2A HTTP calls in both directions,
   matching snapshot hashes, cancellation during peer generation, causal replay
   scores, corrections, feed recovery, queue pressure, persistence, WebSocket
   ownership/reconnect, and speech ordering/failure boundaries.
@@ -10,13 +10,24 @@ Checked locally on Windows on October 6, 2026, without OpenAI credentials.
   Additional coverage checks concurrent broadcast ownership, causal context after
   pause/reopen/highlight jumps, live resume, ordered revisions, saved scoreboard
   dates, and every bundled play's demo call/reply with rolling conversation memory.
-- Frontend: **30 tests passed**; TypeScript checks, formatting and Vite production build passed.
+  New regressions verify ordered emission through slow journal writes, shared run
+  restoration, live baseline timing, stale poll cancellation, revision deduplication
+  after crashes, final-game completion, pregame waiting, and terminal state persistence.
+  Commentary checks use actual previous plays, source-aware down/distance, retained
+  turnover penalties, named defenders and validated editable offline delivery.
+- Frontend: **54 tests passed**; TypeScript checks, formatting and Vite production build passed.
   Audio regressions cover mid-segment unmute, delayed callbacks, partial streams,
   playback ownership, actual played samples and stale state responses.
-- Browser: **8 isolated Chromium checks passed**, covering desktop, mobile,
+  Additional tests cover missing speech callbacks, blocked audio resume, failed
+  cancellation/scheduling, silent playback ownership, bounded HTTP/JSON requests,
+  caller abort cleanup, snapshot-specific exchange grouping and transcript export.
+- Browser: **13 isolated Chromium checks passed**, covering desktop, mobile,
   all 32 loaded team logos, actual agent lead alternation, debugger, restart,
   explicit live-feed failure, real highlight selection, keyboard focus, failed
   game changes, stale polling and read-only saved runs after failed regeneration.
+  They also check one-click handoff navigation locks, frozen source facts,
+  transcript download, agent health recovery, leaving saved runs for empty live
+  feeds, failed mode transitions and retry after an initial API failure.
   No unexpected browser errors or page overflow observed; recovery tests deliberately
   simulate failed HTTP responses.
 - Ruff and Python dependency checks passed. npm audit reported zero vulnerabilities.
@@ -25,8 +36,9 @@ Checked locally on Windows on October 6, 2026, without OpenAI credentials.
 - Additional HTTP replay checks passed for Super Bowl play `1468` (Philadelphia
   interception-return touchdown) and opening-night play `4221` (reversed Baltimore
   touchdown ruled incomplete). The two agents used the corrected frozen facts.
-- On October 5, the actual ESPN adapter fetched scoreboard metadata and **188 summary plays**
-  for opening-night event `401671789`, with successful polling and no fallback warning.
+- On October 7, the actual ESPN adapter fetched scoreboard metadata and **188 distinct
+  summary plays** for opening-night event `401671789`, with verified final status
+  and no fallback warning.
 
 GitHub Actions now starts all services and repeats the HTTP smoke and browser
 checks after unit tests and a clean production build on Linux. Browser failure

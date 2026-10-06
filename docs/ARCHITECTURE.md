@@ -40,7 +40,13 @@ The journal saves snapshots, transcript turns, observable traces, and metrics. L
 
 Run events carry a sequence and epoch. Reconnect uses a cursor and marks recovered events historical, preventing repeated speech. Pausing/resetting/stopping invalidates in-flight work; game switching also clears queued audio. Slow browser streams disconnect and recover history instead of dropping arbitrary audio samples.
 
+Per-session emission locks preserve sequence order across SQLite writes, polling, and agent artifacts. Saved HTTP/WS reconnects restore one shared broadcast object. Live baselines populate causal history before their latest play is queued. Delivered revision IDs are persisted so resuming or recovering a partial exchange cannot silently repeat spoken commentary. Older corrections exclude dialogue about later plays.
+
+Browser speech has separate start and completion deadlines; missing callbacks cancel the segment and release ownership. Audio device failures, malformed PCM, and transport acknowledgement failures are reported to the studio. GPT-Live session writes have explicit deadlines, and cancellation never seals unfinished speech. The coordinator permits up to 60 seconds for the browser to play a lead/reply pair; acknowledgement normally releases it much earlier.
+
 Live polling continues while a commentary exchange runs. Routine backlog is coalesced; important scoring, turnover, penalty and correction events are retained. Poll success and latest-play age are separate signals. No automatic live-to-replay substitution occurs.
+
+The React workspace groups transcripts by exchange and snapshot hash, preserving each revision's score rather than applying the current scoreboard to old dialogue. Navigation stays locked through one-click highlight creation and stepping. WebSocket handlers are scoped to their owning socket; detached sockets cannot clear new audio or advance a new run's cursor. HTTP requests have a 45-second default deadline through body decoding, and caller cancellation is preserved.
 
 ## API contracts
 

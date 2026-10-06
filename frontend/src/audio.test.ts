@@ -355,4 +355,201 @@ describe('broadcast audio ownership', () => {
     expect(scheduled).toHaveLength(0);
     expect(ack).toHaveBeenCalledExactlyOnceWith('muted', 0, true);
   });
+  it('recovers the queue if the speech engine never starts a line', async () => {
+    const ack = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    audio.demo('A lead call.', 'a', 'lead');
+    audio.demo('A peer reply.', 'b', 'peer');
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(ack).toHaveBeenCalledExactlyOnceWith('lead', 0, true);
+    expect(window.speechSynthesis.cancel).toHaveBeenCalledOnce();
+    expect(window.speechSynthesis.speak).toHaveBeenCalledTimes(2);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('stopped responding'), false);
+    const peer = vi.mocked(window.speechSynthesis.speak).mock.calls[1][0] as unknown as Utterance;
+    peer.onstart?.();
+    peer.onend?.();
+    expect(ack.mock.calls).toEqual([
+      ['lead', 0, true],
+      ['peer', 0, false],
+    ]);
+  });
+  it('cancels speech that starts but never reports completion', async () => {
+    const ack = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack);
+    await audio.unlock();
+    audio.demo('A short line.', 'a', 'stalled');
+    const utterance = vi.mocked(window.speechSynthesis.speak).mock
+      .calls[0][0] as unknown as Utterance;
+    utterance.onstart?.();
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(ack).toHaveBeenCalledExactlyOnceWith('stalled', 0, true);
+    utterance.onend?.();
+    expect(ack).toHaveBeenCalledOnce();
+  });
+  it('uses the default voice if voice enumeration fails', async () => {
+    vi.spyOn(window.speechSynthesis, 'getVoices').mockImplementation(() => {
+      throw new Error('Voices unavailable');
+    });
+    const ack = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    expect(() => audio.demo('A call.', 'a', 'demo')).not.toThrow();
+    const utterance = vi.mocked(window.speechSynthesis.speak).mock
+      .calls[0][0] as unknown as Utterance;
+    expect(utterance.voice).toBe(null);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('default voice'), false);
+    utterance.onend?.();
+    expect(ack).toHaveBeenCalledExactlyOnceWith('demo', 0, false);
+  });
+  it('contains utterance construction failures and releases ownership', async () => {
+    vi.stubGlobal(
+      'SpeechSynthesisUtterance',
+      class {
+        constructor() {
+          throw new Error('Unavailable');
+        }
+      },
+    );
+    const ack = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    expect(() => audio.demo('A call.', 'a', 'failed')).not.toThrow();
+    expect(ack).toHaveBeenCalledExactlyOnceWith('failed', 0, true);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('could not speak'), false);
+  });
+  it('finishes cleanup even when browser speech cancellation throws', async () => {
+    vi.mocked(window.speechSynthesis.cancel).mockImplementation(() => {
+      throw new Error('Cannot cancel');
+    });
+    const ack = vi.fn(),
+      speaking = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(speaking, ack, issue);
+    await audio.unlock();
+    audio.demo('A lead.', 'a', 'lead');
+    audio.demo('A reply.', 'b', 'peer');
+    expect(() => audio.clear()).not.toThrow();
+    expect(ack.mock.calls).toEqual([
+      ['lead', 0, true],
+      ['peer', 0, true],
+    ]);
+    expect(speaking).toHaveBeenLastCalledWith(null);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('Voice has been muted'), true);
+    audio.demo('A later line.', 'a', 'later');
+    expect(window.speechSynthesis.speak).toHaveBeenCalledOnce();
+    expect(ack).toHaveBeenLastCalledWith('later', 0, true);
+  });
+  it('contains WebAudio scheduling errors and still plays a valid following segment', async () => {
+    let fail = true;
+    class UnstableContext extends Context {
+      createBuffer(channels: number, length: number, rate: number) {
+        if (fail) {
+          fail = false;
+          throw new Error('Audio device unavailable');
+        }
+        return super.createBuffer(channels, length, rate);
+      }
+    }
+    vi.stubGlobal('AudioContext', UnstableContext);
+    const ack = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    expect(() =>
+      audio.chunk({ segment_id: 'failed', agent_id: 'a', chunk_index: 0, audio: pcm([1, 1]) }),
+    ).not.toThrow();
+    audio.chunk({ segment_id: 'next', agent_id: 'b', chunk_index: 0, audio: pcm([1, 1]) });
+    audio.seal({ segment_id: 'next', total_samples: 2 });
+    await vi.runAllTimersAsync();
+    expect(ack.mock.calls).toEqual([
+      ['failed', 0, true],
+      ['next', 2, false],
+    ]);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('could not play'), false);
+  });
+  it('allows demo speech when only the speech synthesis API is available', async () => {
+    vi.stubGlobal('AudioContext', undefined);
+    const ack = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack);
+    await audio.unlock();
+    audio.demo('A call.', 'a', 'demo');
+    const utterance = vi.mocked(window.speechSynthesis.speak).mock
+      .calls[0][0] as unknown as Utterance;
+    utterance.onend?.();
+    expect(ack).toHaveBeenCalledExactlyOnceWith('demo', 0, false);
+    audio.chunk({ segment_id: 'pcm', agent_id: 'b', chunk_index: 0, audio: pcm([1, 1]) });
+    expect(ack).toHaveBeenLastCalledWith('pcm', 0, true);
+  });
+  it('does not strand later speakers when the acknowledgement transport throws', async () => {
+    let fail = true;
+    const ack = vi.fn(() => {
+      if (fail) {
+        fail = false;
+        throw new Error('Socket closed');
+      }
+    });
+    const issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    audio.demo('A lead.', 'a', 'lead');
+    audio.demo('A peer.', 'b', 'peer');
+    const speak = vi.mocked(window.speechSynthesis.speak),
+      lead = speak.mock.calls[0][0] as unknown as Utterance;
+    expect(() => lead.onend?.()).not.toThrow();
+    const peer = speak.mock.calls[1][0] as unknown as Utterance;
+    peer.onend?.();
+    expect(ack.mock.calls).toEqual([
+      ['lead', 0, false],
+      ['peer', 0, false],
+    ]);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('acknowledgement'), false);
+  });
+  it('times out an audio resume that never resolves', async () => {
+    class NeverContext extends Context {
+      resume() {
+        return new Promise<void>(() => {});
+      }
+    }
+    vi.stubGlobal('AudioContext', NeverContext);
+    const ack = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack);
+    const result = expect(audio.unlock()).rejects.toThrow('did not enable audio in time');
+    await vi.advanceTimersByTimeAsync(8000);
+    await result;
+    audio.demo('A call.', 'a', 'muted');
+    expect(ack).toHaveBeenCalledExactlyOnceWith('muted', 0, true);
+  });
+  it('rejects new PCM after a seal rather than extending completed speech', async () => {
+    const ack = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack);
+    await audio.unlock();
+    audio.chunk({ segment_id: 'sealed', agent_id: 'a', chunk_index: 0, audio: pcm([1, 1]) });
+    audio.seal({ segment_id: 'sealed', total_samples: 2 });
+    audio.chunk({ segment_id: 'sealed', agent_id: 'a', chunk_index: 1, audio: pcm([1, 1]) });
+    await vi.runAllTimersAsync();
+    expect(scheduled).toHaveLength(1);
+    expect(ack).toHaveBeenCalledExactlyOnceWith('sealed', 0, true);
+  });
+  it('cancels a segment if the audio device closes and recreates it on the next unlock', async () => {
+    const ack = vi.fn(),
+      issue = vi.fn(),
+      audio = new BroadcastAudio(vi.fn(), ack, issue);
+    await audio.unlock();
+    audio.chunk({ segment_id: 'closed', agent_id: 'a', chunk_index: 0, audio: pcm([1, 1]) });
+    audio.seal({ segment_id: 'closed', total_samples: 2 });
+    Object.assign(contexts[0], { state: 'closed', frozen: 0 });
+    await vi.runAllTimersAsync();
+    expect(ack).toHaveBeenCalledExactlyOnceWith('closed', 0, true);
+    expect(issue).toHaveBeenCalledWith(expect.stringContaining('device closed'), false);
+    await audio.unlock();
+    expect(contexts).toHaveLength(2);
+    audio.chunk({ segment_id: 'next', agent_id: 'b', chunk_index: 0, audio: pcm([1, 1]) });
+    audio.seal({ segment_id: 'next', total_samples: 2 });
+    await vi.runAllTimersAsync();
+    expect(ack).toHaveBeenLastCalledWith('next', 2, false);
+  });
 });

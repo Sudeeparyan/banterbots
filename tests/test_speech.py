@@ -159,3 +159,98 @@ async def test_audio_without_observed_transcript_is_not_passed_as_spoken_text():
 
     with pytest.raises(RuntimeError, match="observed"):
         await speak(payload, turn, emit, client_factory=lambda **kwargs: FakeClient(connection), max_seconds=0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["start", "instructions", "input_audio", "close"])
+async def test_stalled_voice_writes_are_bounded_and_close_the_session(operation):
+    payload, turn = payload_and_turn()
+    connection = FakeConnection()
+    close_called = asyncio.Event()
+    original_close = connection.close
+
+    async def stalled(**kwargs):
+        await asyncio.Event().wait()
+
+    async def close():
+        close_called.set()
+        await original_close()
+
+    connection.session.close = close
+    if operation == "start":
+        connection.session.start = stalled
+        expected = "session start"
+    elif operation == "instructions":
+        connection.session.instructions.append = stalled
+        expected = "speech instructions"
+    elif operation == "input_audio":
+        connection.session.input_audio.append = stalled
+        expected = "silent input"
+    else:
+        attempts = 0
+
+        async def stalled_close():
+            nonlocal attempts
+            attempts += 1
+            close_called.set()
+            if attempts == 1:
+                await asyncio.Event().wait()
+            else:
+                await original_close()
+
+        connection.session.close = stalled_close
+        expected = "session close"
+
+    async def emit(event):
+        pass
+
+    with pytest.raises(SpeechFailure, match=f"{expected} timed out"):
+        await asyncio.wait_for(speak(payload, turn, emit, client_factory=lambda **kwargs: FakeClient(connection),
+                                     max_seconds=0.1, io_timeout=0.02), 1)
+    assert close_called.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_voice_closes_upstream_and_never_seals_partial_audio():
+    payload, turn = payload_and_turn()
+    connection = FakeConnection()
+    events = []
+    heard = asyncio.Event()
+
+    async def emit(event):
+        events.append(event)
+        if event["type"] == "audio":
+            heard.set()
+
+    task = asyncio.create_task(speak(payload, turn, emit, client_factory=lambda **kwargs: FakeClient(connection)))
+    await asyncio.wait_for(heard.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    before = len(events)
+    await asyncio.sleep(0.03)
+    assert len(events) == before
+    assert any(call[0] == "close" for call in connection.calls)
+    assert not any(event["type"] == "segment.sealed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_bad_output_audio_preserves_only_observed_text_and_never_seals():
+    payload, turn = payload_and_turn()
+    connection = FakeConnection()
+
+    async def bad_instructions(**kwargs):
+        await connection.queue.put(SimpleNamespace(type="session.output_transcript.delta", delta="Observed words."))
+        await connection.queue.put(SimpleNamespace(type="session.output_audio.delta", delta="%%%invalid%%%"))
+
+    connection.session.instructions.append = bad_instructions
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    with pytest.raises(SpeechFailure) as failure:
+        await speak(payload, turn, emit, client_factory=lambda **kwargs: FakeClient(connection))
+    assert failure.value.observed_text == "Observed words."
+    assert failure.value.samples == 0
+    assert not any(event["type"] == "segment.sealed" for event in events)

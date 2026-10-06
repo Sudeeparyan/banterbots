@@ -46,6 +46,8 @@ class Broadcast:
     history_start_seq: int = 0
     seen: dict[str, PlayEvent] = field(default_factory=dict)
     pending: list[PlayEvent] = field(default_factory=list)
+    commented_revisions: dict[str, int] = field(default_factory=dict)
+    emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def view(self):
         return {"id": self.id, "epoch": self.epoch, "game": self.game.model_dump(),
@@ -55,6 +57,7 @@ class Broadcast:
                 "voice_enabled": self.config.voice_enabled, "created_at": self.created_at,
                 "snapshot": self.snapshot, "turns": self.turns, "events": self.events[-300:],
                 "feed": self.feed, "metrics": self.metrics, "exchanges": self.exchanges,
+                "commented_revisions": self.commented_revisions,
                 "start_index": self.config.start_index, "seq": self.seq, "history_start_seq": self.history_start_seq}
 
 
@@ -76,6 +79,7 @@ class Engine:
         self.provider = ESPNProvider()
         self.active: str | None = None
         self.lifecycle = asyncio.Lock()
+        self.restore_lock = asyncio.Lock()
         graph = StateGraph(GraphState)
         for name, handler in [("normalize", self.normalize), ("snapshot", self.make_snapshot),
                               ("choose_lead", self.choose_lead), ("a2a_exchange", self.agent_exchange),
@@ -87,6 +91,12 @@ class Engine:
         self.graph = graph.compile(checkpointer=checkpointer)
 
     async def emit(self, session: Broadcast, kind: str, data: dict, epoch: int | None = None):
+        # Polling, graph output and playback acknowledgements share one stream.
+        # A slower SQLite write must not let a later sequence overtake its facts.
+        async with session.emit_lock:
+            await self._emit(session, kind, data, epoch)
+
+    async def _emit(self, session: Broadcast, kind: str, data: dict, epoch: int | None = None):
         if epoch is not None and epoch != session.epoch:
             return
         data = redact(data)
@@ -148,6 +158,14 @@ class Engine:
     async def get(self, sid):
         if sid in self.sessions:
             return self.sessions[sid]
+        # HTTP and WebSocket reconnects can request the same saved run together.
+        # Restore one shared object so listeners and controls cannot diverge.
+        async with self.restore_lock:
+            return await self._get(sid)
+
+    async def _get(self, sid):
+        if sid in self.sessions:
+            return self.sessions[sid]
         saved = await self.journal.get(sid)
         if not saved:
             raise KeyError(sid)
@@ -156,9 +174,11 @@ class Engine:
                                voice_enabled=saved.get("voice_enabled", True), date=saved.get("date"))
         session = Broadcast(id=sid, config=config, game=Game.model_validate(saved["game"]),
                             epoch=saved["epoch"] + 1, index=saved["index"],
+                            status=saved["status"] if saved["status"] in {"completed", "stopped", "error"} else "paused",
                             created_at=saved["created_at"], snapshot=saved["snapshot"],
                             turns=saved["turns"], metrics=saved["metrics"],
                             exchanges=saved.get("exchanges", 0), feed=saved["feed"],
+                            commented_revisions=saved.get("commented_revisions", {}),
                             history_start_seq=saved.get("history_start_seq", 0),
                             replay=get_replay_events(config.game_id) if config.mode == "replay" else [])
         events = await self.journal.events(sid)
@@ -201,6 +221,14 @@ class Engine:
         for turn in session.turns:
             completed.setdefault(turn["exchange_id"], set()).add(turn["agent_id"])
         session.exchanges = max(session.exchanges, sum(agents == {"a", "b"} for agents in completed.values()))
+        if config.mode == "live":
+            snapshots = {event["data"]["snapshot"]["hash"]: event["data"]["snapshot"]["event"]
+                         for event in events if event["type"] == "snapshot" and event["seq"] >= session.history_start_seq}
+            for turn in session.turns:
+                captured = snapshots.get(turn["snapshot_hash"])
+                if captured:
+                    session.commented_revisions[captured["id"]] = max(
+                        session.commented_revisions.get(captured["id"], 0), captured.get("revision", 1))
         self.sessions[sid] = session
         return session
 
@@ -241,6 +269,7 @@ class Engine:
                 session.turns.clear()
                 session.history_start_seq = session.seq + 1
                 session.seen.clear()
+                session.commented_revisions.clear()
                 session.metrics.clear()
                 session.snapshot = GameSnapshot(event=session.replay[session.index]).seal().model_dump() if session.replay else None
                 await self.state(session)
@@ -283,7 +312,11 @@ class Engine:
         history = [{k: p.get(k) for k in ("id", "quarter", "clock", "description", "home_score", "away_score",
                                          "play_type", "flags")}
                    for p in history]
-        snapshot = GameSnapshot(event=event, drive_history=history, recent_turns=session.turns[-8:]).seal()
+        known = session.seen.values() if session.config.mode == "live" else session.replay
+        sequence_by_id = {play.id: play.sequence for play in known}
+        recent_turns = [turn for turn in session.turns
+                        if sequence_by_id.get(turn["event_id"], event.sequence + 1) <= event.sequence][-8:]
+        snapshot = GameSnapshot(event=event, drive_history=history, recent_turns=recent_turns).seal()
         session.snapshot = snapshot.model_dump()
         await self.emit(session, "snapshot", {"snapshot": session.snapshot}, state["epoch"])
         await self.emit(session, "trace", {"node": "snapshot", "phase": "complete", "snapshot_hash": snapshot.hash}, state["epoch"])
@@ -362,31 +395,46 @@ class Engine:
         if session.player and session.config.voice_enabled and session.last_segment:
             event = session.playback.setdefault(session.last_segment, asyncio.Event())
             try:
-                await asyncio.wait_for(event.wait(), timeout=30)
+                # The acknowledgement is for the peer, after both utterances.
+                # Browser voices may legitimately take 25 seconds each.
+                await asyncio.wait_for(event.wait(), timeout=60)
             except TimeoutError:
                 await self.emit(session, "trace", {"node": "playback", "phase": "timeout", "segment_id": session.last_segment})
 
     async def live_poll(self, session):
+        epoch = session.epoch
         while not session.cancel.is_set():
             try:
                 events = await self.provider.events(session.game.id)
+                if epoch != session.epoch:
+                    return
+                current_game = self.provider.known_game(session.game.id)
+                if current_game is not None:
+                    session.game = current_game
                 session.feed = {"status": "connected", "last_success": now(),
                                 "latest_play_at": events[-1].occurred_at if events else None,
-                                "source": self.provider.last_source, "warning": self.provider.last_error}
-                if not session.seen:
-                    session.pending.extend(events[-1:])
-                    for event in events:
-                        await self.emit(session, "source.event", {"event": event.model_dump(), "baseline": True})
+                                "source": self.provider.last_source, "warning": self.provider.last_error,
+                                "game_status": session.game.status}
+                baseline = not session.seen
+                source_updates = []
+                if baseline:
+                    source_updates = [(event, True) for event in events]
                 else:
                     for event in events:
                         previous = session.seen.get(event.id)
                         if previous is None or event.revision != previous.revision:
-                            await self.emit(session, "source.event", {"event": event.model_dump(), "baseline": False})
                             if previous:
                                 event.flags = list(set(event.flags + ["correction"]))
+                            source_updates.append((event, False))
                             session.pending = [queued for queued in session.pending if queued.id != event.id]
                             session.pending.append(event)
+                # Seed all observed facts before exposing the latest play to the
+                # consumer. Persisting baseline rows can otherwise yield and
+                # let commentary start with an empty drive-history snapshot.
                 session.seen.update({e.id: e for e in events})
+                if baseline:
+                    session.pending.extend(event for event in events[-1:]
+                                           if session.commented_revisions.get(event.id) != event.revision)
                 session.pending.sort(key=lambda event: event.sequence)
                 if len(session.pending) > 32:
                     important = [p for p in session.pending if set(p.flags) & {"scoring", "touchdown", "turnover", "interception", "fumble_lost", "penalty", "correction"}]
@@ -396,11 +444,17 @@ class Engine:
                     session.pending = sorted(retained.values(), key=lambda e: e.sequence)
                     await self.emit(session, "trace", {"node": "backpressure", "phase": "coalesced",
                                     "skipped": len(skipped_ids), "skipped_event_ids": skipped_ids,
-                                    "reason": "Routine stale commentary coalesced; important plays retained."})
+                                    "reason": "Routine stale commentary coalesced; important plays retained."}, epoch)
+                for event, is_baseline in source_updates:
+                    await self.emit(session, "source.event", {"event": event.model_dump(), "baseline": is_baseline}, epoch)
+                    if epoch != session.epoch:
+                        return
             except Exception as exc:
+                if epoch != session.epoch:
+                    return
                 session.feed = {**session.feed, "status": "error", "error": str(exc)}
-                await self.emit(session, "error", {"component": "live_feed", "message": str(exc), "recoverable": True})
-            await self.emit(session, "feed", session.feed)
+                await self.emit(session, "error", {"component": "live_feed", "message": str(exc), "recoverable": True}, epoch)
+            await self.emit(session, "feed", session.feed, epoch)
             await asyncio.sleep(5 if session.feed["status"] == "connected" else 10)
 
     async def run(self, session, once=False):
@@ -420,6 +474,9 @@ class Engine:
                     event = session.replay[session.index]
                 else:
                     if not session.pending:
+                        if session.game.status == "final" and session.feed["status"] == "connected":
+                            session.status = "completed"
+                            break
                         await asyncio.sleep(0.2)
                         continue
                     event = session.pending.pop(0)
@@ -427,15 +484,20 @@ class Engine:
                 prior_turns = len(session.turns)
                 consumed = False
                 await self.one(session, event)
+                if session.config.mode == "live":
+                    session.commented_revisions[event.id] = event.revision
                 session.index += 1
                 consumed = True
                 await self.state(session)
                 if once:
                     await self.wait_playback(session)
-                    session.status = "paused"
+                    finished = session.config.mode == "replay" and session.index >= len(session.replay)
+                    finished = finished or (session.config.mode == "live" and session.game.status == "final" and not session.pending)
+                    session.status = "completed" if finished else "paused"
                     break
                 await self.wait_playback(session)
-                await asyncio.sleep(max(0.5, 4 / session.config.speed))
+                if session.config.mode == "replay":
+                    await asyncio.sleep(max(0.5, 4 / session.config.speed))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -446,6 +508,8 @@ class Engine:
             if current and not consumed:
                 published = session.turns[prior_turns:]
                 if published:
+                    if session.config.mode == "live":
+                        session.commented_revisions[current.id] = current.revision
                     # Preserve audible history and explicitly consume an interrupted
                     # partial exchange instead of silently repeating the lead call.
                     for turn in published:
@@ -465,5 +529,5 @@ class Engine:
 
     async def close(self):
         for session in list(self.sessions.values()):
-            await self.halt(session)
+            await self.halt(session, session.status if session.status in {"completed", "stopped", "error"} else "paused")
         await self.provider.aclose()

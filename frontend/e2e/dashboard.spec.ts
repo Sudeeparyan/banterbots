@@ -8,7 +8,7 @@ async function enterStudio(page: Page) {
     if (message.type() === 'error') errors.push(message.text());
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Game day. Two ways.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'The broadcast booth.' })).toBeVisible();
   await expect(page.getByText('Studio connected', { exact: true })).toBeAttached();
   await expect(page.getByRole('button', { name: 'Advance one play' })).toBeEnabled();
   return errors;
@@ -119,8 +119,6 @@ test('replay moments jump to a real reversal without exposing future results', a
   await expect(moments).toBeVisible();
   await moments.getByRole('button', { name: /Review reversal/ }).click();
   await expect(page.locator('.score-kicker')).toContainText('Q4');
-  await expect(page.locator('.commentary-turn')).toHaveCount(0);
-  await page.getByRole('button', { name: 'Advance one play' }).click();
   await expect(page.locator('.commentary-turn')).toHaveCount(2);
   await expect(page.locator('.conversation')).toContainText(/incomplete|review|overturn/i);
   await page.getByRole('button', { name: /Agent debugger/ }).click();
@@ -128,6 +126,62 @@ test('replay moments jump to a real reversal without exposing future results', a
   await expect(page.locator('.turn-proof').first()).toBeVisible();
   await noOverflow(page);
   expect(errors).toEqual([]);
+});
+
+test('one-click replay locks navigation during handoff and groups frozen facts', async ({
+  page,
+}) => {
+  const errors = await enterStudio(page);
+  let release: () => void = () => {};
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route('**/api/sessions/*/control', async (route) => {
+    if (route.request().postDataJSON().action === 'step') await blocked;
+    await route.continue();
+  });
+  await page
+    .getByRole('region', { name: 'Replay moments' })
+    .getByRole('button', { name: /Review reversal/ })
+    .click();
+  await expect(page.locator('#game')).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Live feed', exact: true })).toBeDisabled();
+  release();
+  await expect(page.getByLabel('Exchange 1')).toBeVisible();
+  await expect(page.locator('.commentary-turn')).toHaveCount(2);
+  await expect(page.locator('.exchange-context')).toContainText('Q4');
+  await page.locator('.exchange-facts summary').click();
+  await expect(page.locator('.exchange-facts p')).toContainText(/reversed|incomplete/i);
+  const download = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Download commentary transcript' }).click();
+  expect((await download).suggestedFilename()).toMatch(/^banterbots-BAL-KC-.*\.txt$/);
+  await noOverflow(page);
+  expect(errors).toEqual([]);
+});
+
+test('offline commentator blocks starting and recovers when service health returns', async ({
+  page,
+}) => {
+  await page.clock.install();
+  let healthy = false;
+  await page.route('**/api/health', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: healthy ? 'ok' : 'degraded',
+        agents: { a: true, b: healthy },
+      }),
+    }),
+  );
+  await page.goto('/');
+  await expect(page.getByText('Studio connected', { exact: true })).toBeAttached();
+  await expect(page.getByRole('status')).toContainText('Riley is offline');
+  await expect(page.getByRole('button', { name: 'Start broadcast' })).toBeDisabled();
+  healthy = true;
+  await page.clock.fastForward(10000);
+  await expect(page.getByRole('status')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Start broadcast' })).toBeEnabled();
 });
 
 test('team filtering keeps active game honest and dialogs support keyboard close', async ({
@@ -241,5 +295,68 @@ test('failed regeneration keeps saved results read only', async ({ page }) => {
   await expect(page.locator('.saved-banner')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Start broadcast' })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Advance one play' })).toBeDisabled();
+  await expect(page.locator('.commentary-turn')).toHaveCount(2);
+});
+
+test('leaving a saved run for an empty live feed clears recorded status', async ({ page }) => {
+  await enterStudio(page);
+  await page.getByRole('button', { name: 'Advance one play' }).click();
+  await expect(page.locator('.commentary-turn')).toHaveCount(2);
+  await page.getByRole('button', { name: 'Saved runs' }).click();
+  await page.locator('.saved-list button').first().click();
+  await expect(page.locator('.saved-banner')).toBeVisible();
+  await page.route('**/api/games?mode=live*', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ games: [], feed: { status: 'connected' } }),
+    }),
+  );
+  await page.getByRole('button', { name: 'Live feed', exact: true }).click();
+  await expect(page.locator('.score-list')).toContainText('No live games');
+  await expect(page.locator('.saved-banner')).toHaveCount(0);
+  await expect(page.getByText('Recorded session', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.commentary-turn')).toHaveCount(0);
+});
+
+test('failed mode transition keeps the current replay facts and labels', async ({ page }) => {
+  await enterStudio(page);
+  await page.route('**/api/sessions/*/control', async (route) => {
+    if (route.request().postDataJSON().action === 'stop')
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Studio stop unavailable' }),
+      });
+    else await route.continue();
+  });
+  await page.getByRole('button', { name: 'Live feed', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('Studio stop unavailable');
+  await expect(page.locator('.mode-label')).toContainText('HISTORICAL REPLAY');
+  await expect(page.locator('.mini-game')).toHaveCount(2);
+  await expect(page.locator('#game')).toHaveValue('2024_01_BAL_KC');
+  await expect(page.getByText('Studio connected', { exact: true })).toBeAttached();
+});
+
+test('studio retry recovers from an unavailable initial API without a page reload', async ({
+  page,
+}) => {
+  let available = false;
+  await page.route('**/api/config', async (route) => {
+    if (!available)
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Studio warming up' }),
+      });
+    else await route.continue();
+  });
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'Retry connection' })).toBeVisible();
+  await expect(page.getByRole('alert')).toContainText('Studio warming up');
+  available = true;
+  await page.getByRole('button', { name: 'Retry connection' }).click();
+  await expect(page.getByText('Studio connected', { exact: true })).toBeAttached();
+  await page.getByRole('button', { name: 'Advance one play' }).click();
   await expect(page.locator('.commentary-turn')).toHaveCount(2);
 });

@@ -318,6 +318,10 @@ class ESPNProvider:
             self.last_error = f"ESPN scoreboard: {exc}"
             raise
 
+    def known_game(self, game_id: str) -> Game | None:
+        """Latest verified header metadata, separate from causal agent facts."""
+        return self._games.get(game_id)
+
     async def _core_plays(self, game_id: str) -> list[tuple[dict[str, Any], None]]:
         payload = await self._get(self.CORE.format(game_id=game_id), limit=1000)
         items = list(payload.get("items") or [])
@@ -356,7 +360,9 @@ class ESPNProvider:
             if not game:
                 raise ValueError(f"ESPN game {game_id} has no verified team metadata")
             plays = flatten_summary_plays(payload)
-            if not plays:
+            header_status = competitions[0].get("status", header.get("status", {})) if competitions else {}
+            scheduled = header_status.get("type", {}).get("state") == "pre"
+            if not plays and not (scheduled and not summary_error):
                 plays = await self._core_plays(game_id)
                 self.last_source = "core"
             else:

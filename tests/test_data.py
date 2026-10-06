@@ -265,3 +265,23 @@ def test_scoreboard_canonical_teams_and_live_score():
     assert game.week == 4
     item["week"] = {"number": 4}
     assert parse_scoreboard({"events": [item]})[0].week == 4
+
+
+@pytest.mark.asyncio
+async def test_scheduled_game_without_plays_is_healthy_waiting_feed():
+    payload = summary([])
+    payload["header"]["competitions"][0]["status"] = {"type": {"state": "pre"}}
+    paths = []
+
+    def respond(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json=payload) if "summary" in request.url.path else httpx.Response(404)
+
+    provider = ESPNProvider(httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    try:
+        assert await provider.events("123") == []
+        assert provider.last_success_at and provider.last_error is None
+        assert provider.known_game("123").status == "scheduled"
+        assert all("summary" in path for path in paths)
+    finally:
+        await provider.aclose()

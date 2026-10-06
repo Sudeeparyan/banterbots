@@ -132,3 +132,49 @@ async def test_parallel_play_requests_keep_one_graph_running(monkeypatch):
         assert playing[0].id == running[0].id == host.active
     finally:
         await host.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_source_and_graph_events_cannot_overtake_slow_journal_write(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    queue = asyncio.Queue()
+    session.listeners["viewer"] = queue
+    first_write = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_append(event):
+        if event.type == "snapshot":
+            first_write.set()
+            await release.wait()
+
+    monkeypatch.setattr(host.journal, "append", slow_append)
+    try:
+        facts = asyncio.create_task(host.emit(session, "snapshot", {"snapshot": session.snapshot}))
+        await first_write.wait()
+        caption = asyncio.create_task(host.emit(session, "caption.delta", {"text": "Call based on those facts"}))
+        await asyncio.sleep(0)
+        assert queue.empty()
+        release.set()
+        await asyncio.gather(facts, caption)
+        ordered = [queue.get_nowait(), queue.get_nowait()]
+        assert [event["type"] for event in ordered] == ["snapshot", "caption.delta"]
+        assert ordered[0]["seq"] < ordered[1]["seq"]
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_waiting_old_epoch_emit_is_discarded_after_pause():
+    host = engine()
+    session = await host.create(SessionCreate())
+    old_epoch = session.epoch
+    try:
+        async with session.emit_lock:
+            delayed = asyncio.create_task(host.emit(session, "turn", {"turn": {"text": "late call"}}, old_epoch))
+            await asyncio.sleep(0)
+            session.epoch += 1
+        await delayed
+        assert not any(event["type"] == "turn" for event in session.events)
+    finally:
+        await host.provider.aclose()

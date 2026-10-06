@@ -43,19 +43,41 @@ export class BroadcastAudio {
   private generation = 0;
   private speakQueue: Demo[] = [];
   private activeDemo: Demo | null = null;
+  private demoTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingAck = new Set<string>();
   private settled = new Set<string>();
 
   constructor(
     private speaking: (agent: string | null) => void,
     private ack: (id: string, samples: number, cancelled: boolean) => void,
+    private onIssue: (message: string, muted: boolean) => void = () => {},
   ) {}
 
   async unlock() {
     const generation = this.generation;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      this.context ??= new AudioContext({ sampleRate: 24000 });
-      await this.context.resume();
+      const Context =
+        typeof AudioContext !== 'undefined'
+          ? AudioContext
+          : (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (this.context?.state === 'closed') this.context = null;
+      // Buffers specify their own PCM rate. Let the browser choose the output
+      // device rate; forcing 24 kHz rejects otherwise usable audio devices.
+      if (!this.context && Context) this.context = new Context();
+      if (this.context) {
+        await Promise.race([
+          this.context.resume(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('The browser did not enable audio in time')),
+              8000,
+            );
+          }),
+        ]);
+      } else if (!this.hasSpeech()) {
+        throw new Error('This browser does not support spoken commentary');
+      }
       if (generation !== this.generation) return;
       this.muted = false;
       this.pump();
@@ -65,6 +87,8 @@ export class BroadcastAudio {
       this.muted = true;
       this.clear();
       throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -76,7 +100,9 @@ export class BroadcastAudio {
   clear() {
     this.generation++;
     if (this.timer) clearTimeout(this.timer);
+    if (this.demoTimer) clearTimeout(this.demoTimer);
     this.timer = undefined;
+    this.demoTimer = undefined;
     for (const segment of this.segments) {
       const played = this.playedSamples(segment);
       this.stopSources(segment);
@@ -89,7 +115,7 @@ export class BroadcastAudio {
     this.segments = [];
     this.speakQueue = [];
     this.activeDemo = null;
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    this.cancelSpeech();
     this.speaking(null);
   }
 
@@ -97,6 +123,13 @@ export class BroadcastAudio {
     if (this.settled.has(chunk.segment_id) || this.pendingAck.has(chunk.segment_id)) return;
     if (this.muted) {
       this.pendingAck.add(chunk.segment_id);
+      return;
+    }
+    if (!this.context) {
+      this.issue(
+        'Streaming audio is unavailable in this browser. Commentary captions remain available.',
+      );
+      this.discard(chunk.segment_id);
       return;
     }
     if (!Number.isInteger(chunk.chunk_index) || chunk.chunk_index < 0) {
@@ -108,6 +141,15 @@ export class BroadcastAudio {
       segment = this.newSegment(chunk.segment_id, chunk.agent_id);
       this.segments.push(segment);
     }
+    if (
+      segment.sealed &&
+      chunk.chunk_index >= segment.next &&
+      !segment.chunks.has(chunk.chunk_index)
+    ) {
+      this.issue('Audio arrived after its segment was sealed and was skipped.');
+      this.discard(chunk.segment_id);
+      return;
+    }
     if (chunk.chunk_index >= segment.next && !segment.chunks.has(chunk.chunk_index)) {
       try {
         const rate = chunk.rate ?? 24000;
@@ -117,6 +159,7 @@ export class BroadcastAudio {
         if (pcm.length) segment.chunks.set(chunk.chunk_index, { pcm, rate });
         else throw new Error('Empty PCM chunk');
       } catch {
+        this.issue('A commentary audio chunk was invalid and was skipped.');
         this.discard(chunk.segment_id);
         return;
       }
@@ -179,7 +222,38 @@ export class BroadcastAudio {
     // Bound the ledger while retaining recent completions and cancellations.
     if (this.settled.size > 1024) this.settled.delete(this.settled.values().next().value!);
     this.pendingAck.delete(id);
-    this.ack(id, samples, cancelled);
+    try {
+      this.ack(id, samples, cancelled);
+    } catch {
+      this.issue('The audio acknowledgement could not be sent. Reconnect to the broadcast.');
+    }
+  }
+
+  private issue(message: string) {
+    try {
+      this.onIssue(message, this.muted);
+    } catch {
+      /* A display callback cannot interrupt playback cleanup. */
+    }
+  }
+
+  private hasSpeech(): boolean {
+    return (
+      typeof SpeechSynthesisUtterance !== 'undefined' &&
+      typeof window.speechSynthesis?.speak === 'function'
+    );
+  }
+
+  private cancelSpeech(): boolean {
+    try {
+      window.speechSynthesis?.cancel();
+      return true;
+    } catch {
+      // A broken cancellation API must not let another voice overlap this one.
+      this.muted = true;
+      this.issue('The browser could not stop its speech engine. Voice has been muted.');
+      return false;
+    }
   }
 
   private playedSamples(segment: Segment): number {
@@ -206,7 +280,9 @@ export class BroadcastAudio {
     if (this.activeDemo?.id === id) {
       this.generation++;
       this.activeDemo = null;
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      if (this.demoTimer) clearTimeout(this.demoTimer);
+      this.demoTimer = undefined;
+      if (!this.cancelSpeech()) this.clear();
       this.speaking(null);
     }
     this.speakQueue = this.speakQueue.filter((item) => item.id !== id);
@@ -235,24 +311,37 @@ export class BroadcastAudio {
     while (segment.chunks.has(segment.next)) {
       const { pcm, rate } = segment.chunks.get(segment.next)!;
       segment.chunks.delete(segment.next++);
-      const buffer = context.createBuffer(1, pcm.length, rate);
-      buffer.copyToChannel(pcm as Float32Array<ArrayBuffer>, 0);
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(context.destination);
-      const when = Math.max(context.currentTime + 0.015, segment.scheduled);
-      segment.scheduled = when + buffer.duration;
-      segment.scheduledSamples += pcm.length;
-      segment.clips.push({ start: when, samples: pcm.length, rate });
-      segment.sources.push(source);
-      source.start(when);
-      this.speaking(segment.agent);
+      try {
+        const buffer = context.createBuffer(1, pcm.length, rate);
+        buffer.copyToChannel(pcm as Float32Array<ArrayBuffer>, 0);
+        const source = context.createBufferSource();
+        segment.sources.push(source);
+        source.buffer = buffer;
+        source.connect(context.destination);
+        const when = Math.max(context.currentTime + 0.015, segment.scheduled);
+        source.start(when);
+        segment.scheduled = when + buffer.duration;
+        segment.scheduledSamples += pcm.length;
+        segment.clips.push({ start: when, samples: pcm.length, rate });
+        this.speaking(segment.agent);
+      } catch {
+        this.issue(
+          'The browser could not play this commentary segment. Captions remain available.',
+        );
+        this.discard(segment.id);
+        return;
+      }
     }
     if (segment.sealed && segment.scheduledSamples >= segment.total) {
       if (this.timer) clearTimeout(this.timer);
       const generation = this.generation;
       const complete = () => {
         if (generation !== this.generation || this.segments[0] !== segment) return;
+        if (context.state === 'closed') {
+          this.issue('The browser audio device closed during playback. This segment was skipped.');
+          this.discard(segment.id);
+          return;
+        }
         // AudioContext time stops when a browser suspends playback. Wall-clock
         // timers alone would release the peer before the lead was heard.
         const remaining = segment.scheduled - context.currentTime;
@@ -281,7 +370,7 @@ export class BroadcastAudio {
       this.speakQueue.some((item) => item.id === id)
     )
       return;
-    if (this.muted || !('speechSynthesis' in window)) {
+    if (this.muted || !this.hasSpeech()) {
       this.finish(id, 0, true);
       return;
     }
@@ -295,30 +384,56 @@ export class BroadcastAudio {
     if (!item) return;
     this.activeDemo = item;
     const generation = this.generation;
-    const utterance = new SpeechSynthesisUtterance(item.text);
-    const voices = window.speechSynthesis
-      .getVoices()
-      .filter((voice) => voice.lang.startsWith('en'));
-    utterance.voice = voices[item.agent === 'a' ? 0 : Math.min(1, voices.length - 1)] ?? null;
-    utterance.rate = item.agent === 'a' ? 1.09 : 0.98;
-    utterance.pitch = item.agent === 'a' ? 1.03 : 0.86;
     const done = (cancelled: boolean) => {
       if (generation !== this.generation || this.activeDemo !== item) return;
+      if (this.demoTimer) clearTimeout(this.demoTimer);
+      this.demoTimer = undefined;
       this.finish(item.id, 0, cancelled);
       this.activeDemo = null;
       this.speaking(null);
       this.pump();
       this.pumpDemo();
     };
-    utterance.onstart = () => {
-      if (generation === this.generation && this.activeDemo === item) this.speaking(item.agent);
+    const watchdog = () => {
+      if (generation !== this.generation || this.activeDemo !== item) return;
+      this.issue(
+        'Browser speech stopped responding. This line was skipped; captions remain available.',
+      );
+      this.discard(item.id);
     };
-    utterance.onend = () => done(false);
-    utterance.onerror = () => done(true);
     try {
+      const utterance = new SpeechSynthesisUtterance(item.text);
+      try {
+        const voices = window.speechSynthesis
+          .getVoices()
+          .filter((voice) => voice.lang.startsWith('en'));
+        utterance.voice = voices[item.agent === 'a' ? 0 : Math.min(1, voices.length - 1)] ?? null;
+      } catch {
+        this.issue('The browser voice list is unavailable. Its default voice will be used.');
+      }
+      utterance.rate = item.agent === 'a' ? 1.09 : 0.98;
+      utterance.pitch = item.agent === 'a' ? 1.03 : 0.86;
+      utterance.onstart = () => {
+        if (generation !== this.generation || this.activeDemo !== item) return;
+        this.speaking(item.agent);
+        if (this.demoTimer) clearTimeout(this.demoTimer);
+        const duration = Math.min(
+          25000,
+          Math.max(10000, item.text.trim().split(/\s+/).length * 700 + 5000),
+        );
+        this.demoTimer = setTimeout(watchdog, duration);
+      };
+      utterance.onend = () => done(false);
+      utterance.onerror = () => {
+        if (generation !== this.generation || this.activeDemo !== item) return;
+        this.issue('The browser speech engine skipped this line. Captions remain available.');
+        done(true);
+      };
+      this.demoTimer = setTimeout(watchdog, 8000);
       window.speechSynthesis.speak(utterance);
     } catch {
-      done(true);
+      this.issue('The browser could not speak this line. Commentary captions remain available.');
+      this.discard(item.id);
     }
   }
 }
