@@ -85,3 +85,50 @@ async def test_switch_cancels_previous_run():
     assert first.task is None
     assert host.active == second.id
     await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_session_selection_stops_superseded_broadcast(monkeypatch):
+    host = engine()
+    await host.create(SessionCreate())
+    original_halt = host.halt
+
+    async def yielding_halt(*args, **kwargs):
+        await asyncio.sleep(0)
+        return await original_halt(*args, **kwargs)
+
+    monkeypatch.setattr(host, "halt", yielding_halt)
+    try:
+        first, second = await asyncio.gather(host.create(SessionCreate()),
+                                            host.create(SessionCreate(game_id="2024_22_KC_PHI")))
+        assert first.status == "stopped"
+        assert second.status == "paused" and host.active == second.id
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_play_requests_keep_one_graph_running(monkeypatch):
+    host = engine()
+    first = await host.create(SessionCreate(voice_enabled=False))
+    second = await host.create(SessionCreate(game_id="2024_22_KC_PHI", voice_enabled=False))
+    original_halt = host.halt
+
+    async def yielding_halt(*args, **kwargs):
+        await asyncio.sleep(0)
+        return await original_halt(*args, **kwargs)
+
+    async def blocked(*args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host, "halt", yielding_halt)
+    monkeypatch.setattr(host, "one", blocked)
+    try:
+        await asyncio.gather(host.control(first, "play"), host.control(second, "play"))
+        await asyncio.sleep(0)
+        playing = [session for session in (first, second) if session.status == "playing"]
+        running = [session for session in (first, second) if session.task and not session.task.done()]
+        assert len(playing) == len(running) == 1
+        assert playing[0].id == running[0].id == host.active
+    finally:
+        await host.close()

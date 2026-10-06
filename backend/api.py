@@ -17,7 +17,7 @@ from backend.commentary import load_persona
 from backend.contracts import SessionControl, SessionCreate, uid
 from backend.engine import Engine
 from backend.journal import Journal
-from backend.providers import get_replay_games, get_teams
+from backend.providers import get_replay_games, get_replay_highlights, get_teams
 
 structlog.configure(processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()])
 
@@ -84,6 +84,14 @@ async def games(mode: str = "replay", date: str | None = None):
     except Exception as exc:
         return {"games": cached[1]["games"] if cached else [], "feed": {"status": "error", "error": str(exc),
                  "last_success": cached[1]["feed"].get("last_success") if cached else None}}
+
+
+@app.get("/api/games/{game_id}/highlights")
+async def highlights(game_id: str):
+    try:
+        return {"game_id": game_id, "highlights": get_replay_highlights(game_id)}
+    except ValueError as exc:
+        raise HTTPException(404, "Replay game not found") from exc
 
 
 async def session_or_404(sid):

@@ -1,5 +1,17 @@
 # Real replay data and live feed
 
+The [nflverse organization](https://github.com/nflverse),
+[nflverse-data](https://github.com/nflverse/nflverse-data), and its official
+[Python loader](https://github.com/nflverse/nflreadpy) were reviewed again on
+October 6, 2026. This POC downloads the release files directly and bundles its
+two games for a repeatable, offline demonstration. `nflreadpy.load_pbp()` is an
+alternative for expanding the historical game library.
+
+The [published update schedule](https://nflreadr.nflverse.com/articles/nflverse_data_schedule.html)
+describes nightly clean play-by-play updates, post-game raw availability and
+later statistical corrections. These releases are historical replay sources;
+the live booth continues to use the separately labelled ESPN polling adapter.
+
 The committed replay fixtures contain **354 actual plays**, extracted from the
 [nflverse 2024 play-by-play release](https://github.com/nflverse/nflverse-data/releases/tag/pbp).
 The games are Baltimore at Kansas City on September 5, 2024 (178 rows) and

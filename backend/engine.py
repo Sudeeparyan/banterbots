@@ -51,6 +51,7 @@ class Broadcast:
         return {"id": self.id, "epoch": self.epoch, "game": self.game.model_dump(),
                 "mode": self.config.mode, "provider": self.config.provider, "status": self.status,
                 "speed": self.config.speed, "index": self.index, "total": len(self.replay),
+                "date": self.config.date,
                 "voice_enabled": self.config.voice_enabled, "created_at": self.created_at,
                 "snapshot": self.snapshot, "turns": self.turns, "events": self.events[-300:],
                 "feed": self.feed, "metrics": self.metrics, "exchanges": self.exchanges,
@@ -74,6 +75,7 @@ class Engine:
         self.sessions: dict[str, Broadcast] = {}
         self.provider = ESPNProvider()
         self.active: str | None = None
+        self.lifecycle = asyncio.Lock()
         graph = StateGraph(GraphState)
         for name, handler in [("normalize", self.normalize), ("snapshot", self.make_snapshot),
                               ("choose_lead", self.choose_lead), ("a2a_exchange", self.agent_exchange),
@@ -125,6 +127,12 @@ class Engine:
             if not game:
                 raise ValueError("Live game is unavailable; refresh the live scoreboard")
             plays = []
+        # Serialize broadcast ownership changes. API requests from rapid clicks
+        # or multiple tabs can interleave while the previous graph is cancelled.
+        async with self.lifecycle:
+            return await self._create(config, game, plays)
+
+    async def _create(self, config, game, plays):
         if self.active and self.active in self.sessions:
             await self.halt(self.sessions[self.active], "stopped")
         session = Broadcast(id=uid(), config=config, game=game, index=config.start_index, replay=plays)
@@ -145,7 +153,7 @@ class Engine:
             raise KeyError(sid)
         config = SessionCreate(game_id=saved["game"]["id"], mode=saved["mode"], provider=saved["provider"],
                                speed=saved["speed"], start_index=saved.get("start_index", 0),
-                               voice_enabled=saved.get("voice_enabled", True))
+                               voice_enabled=saved.get("voice_enabled", True), date=saved.get("date"))
         session = Broadcast(id=sid, config=config, game=Game.model_validate(saved["game"]),
                             epoch=saved["epoch"] + 1, index=saved["index"],
                             created_at=saved["created_at"], snapshot=saved["snapshot"],
@@ -206,10 +214,19 @@ class Engine:
                 await session.task
         session.task = None
         session.pending.clear()
+        if session.config.mode == "live":
+            # Resume is a fresh live join: seed current context and announce the
+            # latest play. Retaining the old dedup baseline after clearing the
+            # pending queue could otherwise leave the resumed show silent.
+            session.seen.clear()
         session.playback.clear()
         await self.state(session)
 
     async def control(self, session, action, speed=None):
+        async with self.lifecycle:
+            await self._control(session, action, speed)
+
+    async def _control(self, session, action, speed=None):
         if action == "speed":
             if speed is None:
                 raise ValueError("Provide a replay speed")
@@ -258,8 +275,11 @@ class Engine:
             history = [p.model_dump() for p in sorted(session.seen.values(), key=lambda p: p.sequence)
                        if p.sequence < event.sequence][-5:]
         else:
-            history = [e["data"]["snapshot"]["event"] for e in session.events
-                       if e["type"] == "snapshot" and e["epoch"] == session.epoch][-5:]
+            # Cancellation epochs identify output ownership, not game context.
+            # Use earlier causal fixtures so pauses, saved-run reopening and
+            # highlight jumps retain the same drive facts without future plays.
+            history = [play.model_dump() for play in session.replay
+                       if play.sequence < event.sequence][-5:]
         history = [{k: p.get(k) for k in ("id", "quarter", "clock", "description", "home_score", "away_score",
                                          "play_type", "flags")}
                    for p in history]
@@ -310,6 +330,9 @@ class Engine:
                         "to": state["lead"], "snapshot_hash": payload.snapshot.hash}, epoch)
         turns = await asyncio.wait_for(exchange(AGENT_A_URL if state["lead"] == "a" else AGENT_B_URL,
                                     payload, forward, session.cancel), timeout=90)
+        await self.emit(session, "trace", {"node": "a2a_exchange", "phase": "complete",
+                        "exchange_id": state["exchange_id"], "snapshot_hash": payload.snapshot.hash,
+                        "turn_count": len(turns)}, epoch)
         return {"turns": [t.model_dump() for t in turns]}
 
     async def finalize(self, state):
@@ -364,6 +387,7 @@ class Engine:
                             session.pending = [queued for queued in session.pending if queued.id != event.id]
                             session.pending.append(event)
                 session.seen.update({e.id: e for e in events})
+                session.pending.sort(key=lambda event: event.sequence)
                 if len(session.pending) > 32:
                     important = [p for p in session.pending if set(p.flags) & {"scoring", "touchdown", "turnover", "interception", "fumble_lost", "penalty", "correction"}]
                     newest = session.pending[-8:]

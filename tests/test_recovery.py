@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
-from backend.contracts import CommentaryTurn, GameSnapshot, RunEvent, SessionCreate
+from backend.contracts import CommentaryTurn, Game, GameSnapshot, RunEvent, SessionCreate
 from backend.engine import Engine
 
 
@@ -85,6 +85,80 @@ async def test_live_join_seeds_recent_context_without_future_plays():
         assert [play["id"] for play in history] == [play.id for play in plays[3:8]]
         assert history[3]["flags"] == ["reversed", "incomplete_pass"]
         assert not {play.id for play in plays[8:]} & {play["id"] for play in history}
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_replay_highlight_and_pause_keep_causal_drive_context():
+    host = engine()
+    session = await host.create(SessionCreate(start_index=98, voice_enabled=False))
+    try:
+        await host.halt(session)
+        result = await host.make_snapshot({"session_id": session.id, "epoch": session.epoch,
+                                           "play": session.replay[98].model_dump()})
+        history = result["snapshot"]["drive_history"]
+        assert [play["id"] for play in history] == [play.id for play in session.replay[93:98]]
+        assert result["snapshot"]["event"]["away_score"] == session.replay[98].away_score
+        assert not {play.id for play in session.replay[98:]} & {play["id"] for play in history}
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_paused_live_resume_reseeds_latest_play_instead_of_stalling(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    session.config.mode = "live"
+    plays = [play.model_copy(update={"source": "espn"}) for play in session.replay[:4]]
+    session.seen = {play.id: play for play in plays}
+    session.pending = plays[-2:]
+    original_sleep = asyncio.sleep
+
+    async def feed(*args):
+        session.cancel.set()
+        return plays
+
+    async def no_wait(*args):
+        await original_sleep(0)
+
+    monkeypatch.setattr(host.provider, "events", feed)
+    monkeypatch.setattr("backend.engine.asyncio.sleep", no_wait)
+    try:
+        await host.halt(session)
+        session.cancel = asyncio.Event()
+        await host.live_poll(session)
+        assert [play.id for play in session.pending] == [plays[-1].id]
+        assert len(session.seen) == len(plays)
+        assert session.feed["status"] == "connected"
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_correction_keeps_queued_live_plays_in_provider_sequence(monkeypatch):
+    host = engine()
+    session = await host.create(SessionCreate())
+    session.config.mode = "live"
+    plays = [play.model_copy(update={"source": "espn"}) for play in session.replay[:5]]
+    session.seen = {play.id: play for play in plays}
+    session.pending = plays[1:]
+    revised = plays[2].model_copy(update={"revision": 2, "description": "Corrected play"})
+    original_sleep = asyncio.sleep
+
+    async def feed(*args):
+        session.cancel.set()
+        return [*plays[:2], revised, *plays[3:]]
+
+    async def no_wait(*args):
+        await original_sleep(0)
+
+    monkeypatch.setattr(host.provider, "events", feed)
+    monkeypatch.setattr("backend.engine.asyncio.sleep", no_wait)
+    try:
+        await host.live_poll(session)
+        assert [play.sequence for play in session.pending] == [1, 2, 3, 4]
+        assert session.pending[1].revision == 2 and "correction" in session.pending[1].flags
     finally:
         await host.provider.aclose()
 
@@ -212,5 +286,47 @@ async def test_reopening_recovers_durable_turn_after_last_state_save(monkeypatch
         assert restored.snapshot["hash"] == snapshot.hash
         assert restored.seq == newer[-1]["seq"]
         assert restored.task is None and forbidden_regeneration.await_count == 0
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_saved_live_run_preserves_scoreboard_date_for_explicit_regeneration(monkeypatch):
+    host = engine()
+    game = Game(id="401671789", home_team="KC", away_team="BAL", mode="live",
+                start_time="2024-09-06T00:20:00Z")
+
+    async def dated_games(date=None):
+        return [game] if date == "20240905" else []
+
+    monkeypatch.setattr(host.provider, "games", dated_games)
+    try:
+        session = await host.create(SessionCreate(game_id=game.id, mode="live", date="20240905"))
+        saved = host.journal.save.call_args.args[0]
+        assert session.view()["date"] == saved["date"] == "20240905"
+        host.journal.get.return_value = saved
+        host.journal.events.return_value = []
+        host.sessions.clear()
+        restored = await host.get(session.id)
+        assert restored.config.date == restored.view()["date"] == "20240905"
+        assert restored.task is None and restored.turns == []
+        regenerated = await host.create(SessionCreate(game_id=game.id, mode="live", date=restored.view()["date"]))
+        assert regenerated.id != restored.id and regenerated.config.date == "20240905"
+    finally:
+        await host.provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_saved_runs_without_date_remain_readable():
+    host = engine()
+    try:
+        session = await host.create(SessionCreate())
+        saved = session.view()
+        saved.pop("date")
+        host.journal.get.return_value = saved
+        host.journal.events.return_value = []
+        host.sessions.clear()
+        restored = await host.get(session.id)
+        assert restored.view()["date"] is None and restored.task is None
     finally:
         await host.provider.aclose()

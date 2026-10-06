@@ -9,7 +9,9 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "check": "npm run typecheck && npm test",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "format": "prettier --write src e2e *.ts *.json",
+    "format:check": "prettier --check src e2e *.ts *.json"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
@@ -21,6 +23,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^6.1.1",
+    "prettier": "3.9.9",
     "typescript": "~5.7.2",
     "vite": "^8.3.2",
     "vitest": "^5.0.3"

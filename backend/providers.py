@@ -109,6 +109,43 @@ def get_replay_events(game_id: str) -> list[PlayEvent]:
     return attribute_scores([PlayEvent.model_validate(row) for row in rows])
 
 
+def get_replay_highlights(game_id: str) -> list[dict[str, Any]]:
+    """Small replay bookmarks, with no play text or score spoilers.
+
+    Keep reviews and possession changes before sampling scores so a late
+    overturned ruling does not disappear behind early extra-point attempts.
+    """
+    events = get_replay_events(game_id)
+    candidates = []
+    opening = next((index for index, event in enumerate(events)
+                    if event.play_type in {"run", "pass", "rush", "passing", "rushing"}
+                    and "no_play" not in event.flags), None)
+    for index, event in enumerate(events):
+        flags = set(event.flags)
+        if "reversed" in flags:
+            category, label, priority = "reversal", "Review reversal", 4
+        elif "turnover" in flags:
+            label = "Turnover touchdown" if "touchdown" in flags else "Interception" if "interception" in flags else "Turnover"
+            category, priority = "turnover", 3
+        elif index == opening:
+            category, label, priority = "opening_drive", "Opening drive", 2
+        elif flags & {"touchdown", "field_goal", "safety"}:
+            category, priority = "scoring", 1
+            label = "Touchdown" if "touchdown" in flags else "Field goal" if "field_goal" in flags else "Safety"
+        else:
+            continue
+        candidates.append((priority, {"index": index, "id": event.id, "label": label,
+                                       "quarter": event.quarter, "clock": event.clock, "category": category}))
+    selected = [bookmark for priority, bookmark in candidates if priority > 1][:8]
+    scores = [bookmark for priority, bookmark in candidates if priority == 1]
+    slots = min(8 - len(selected), len(scores))
+    if slots == 1:
+        selected.append(scores[0])
+    elif slots > 1:
+        selected.extend(scores[round(index * (len(scores) - 1) / (slots - 1))] for index in range(slots))
+    return sorted(selected, key=lambda bookmark: bookmark["index"])
+
+
 def attribute_scores(events: list[PlayEvent]) -> list[PlayEvent]:
     """Attribute a score only from this play's change against its predecessor.
 

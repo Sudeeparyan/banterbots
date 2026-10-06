@@ -7,7 +7,7 @@ import pytest
 from backend.contracts import Game, GameSnapshot
 from backend.providers import (
     DATA, ROOT, ESPNProvider, flatten_summary_plays, get_replay_events,
-    get_replay_games, get_teams, normalize_espn, normalize_nflverse, parse_scoreboard,
+    get_replay_games, get_replay_highlights, get_teams, normalize_espn, normalize_nflverse, parse_scoreboard,
 )
 
 
@@ -104,6 +104,39 @@ def test_fixture_export_has_portable_lf_bytes(tmp_path):
 def test_unknown_replay_id_cannot_access_paths():
     with pytest.raises(ValueError, match="Unknown replay"):
         get_replay_events("../teams")
+
+
+def test_replay_bookmarks_start_on_action_and_keep_late_review_and_defensive_score():
+    for game in get_replay_games():
+        highlights = get_replay_highlights(game.id)
+        events = get_replay_events(game.id)
+        assert 1 <= len(highlights) <= 8
+        assert highlights[0]["category"] == "opening_drive" and highlights[0]["index"] == 2
+        assert [item["index"] for item in highlights] == sorted({item["index"] for item in highlights})
+        for item in highlights:
+            event = events[item["index"]]
+            assert item.keys() == {"index", "id", "label", "quarter", "clock", "category"}
+            assert item["id"] == event.id and item["clock"] == event.clock and item["quarter"] == event.quarter
+            assert "score" not in item and "description" not in item
+    assert any(item["id"] == "4221" and item["category"] == "reversal"
+               for item in get_replay_highlights("2024_01_BAL_KC"))
+    assert any(item["id"] == "1468" and item["label"] == "Turnover touchdown"
+               for item in get_replay_highlights("2024_22_KC_PHI"))
+
+
+def test_replay_highlights_endpoint_is_explicitly_replay_only():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from backend.api import highlights
+
+    application = FastAPI()
+    application.add_api_route("/api/games/{game_id}/highlights", highlights)
+    with TestClient(application) as client:
+        response = client.get("/api/games/2024_01_BAL_KC/highlights")
+        assert response.status_code == 200
+        assert response.json()["game_id"] == "2024_01_BAL_KC"
+        assert response.json()["highlights"][0]["index"] == 2
+        assert client.get("/api/games/401671789/highlights").status_code == 404
 
 
 def test_summary_deduplicates_current_drive_and_orders_numeric_sequence():

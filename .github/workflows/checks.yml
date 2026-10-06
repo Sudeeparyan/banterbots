@@ -18,7 +18,30 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
         working-directory: frontend
+      - run: npm run format:check
+        working-directory: frontend
       - run: npm run check
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - name: Run complete broadcast and browser checks
+        shell: bash
+        run: |
+          python tools/dev.py --no-frontend > services.log 2>&1 &
+          studio_pid=$!
+          trap 'kill "$studio_pid" 2>/dev/null || true' EXIT
+          python tools/wait_for_studio.py
+          python tools/smoke.py
+          cd frontend
+          npm run test:browser
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-and-service-failures
+          path: |
+            frontend/test-results/
+            services.log
