@@ -1648,7 +1648,8 @@ function App() {
             >
               <option value="demo">Demo · no API key needed</option>
               <option value="openai" disabled={!config?.openai_configured}>
-                OpenAI · {config?.openai_configured ? 'connected' : 'add credentials to enable'}
+                OpenAI ·{' '}
+                {config?.openai_configured ? 'key configured' : 'add credentials to enable'}
               </option>
             </select>
           </div>

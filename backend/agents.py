@@ -28,6 +28,7 @@ from backend.a2a_client import exchange
 from backend.commentary import generate_turn, load_persona, validate_request
 from backend.config import AGENT_A_URL, AGENT_B_URL, RUNTIME
 from backend.contracts import AgentRequest, CommentaryTurn
+from backend.security import redact, safe_error
 from backend.speech import speak
 
 logger = logging.getLogger("banterbots.agent")
@@ -71,7 +72,7 @@ class CommentaryExecutor(AgentExecutor):
                 data.setdefault("event_id", request.snapshot.event.id)
                 data.setdefault("snapshot_id", request.snapshot.id)
                 data.setdefault("snapshot_hash", request.snapshot.hash)
-            await updater.add_artifact(parts=[new_data_part(value, media_type="application/json")],
+            await updater.add_artifact(parts=[new_data_part(redact(value), media_type="application/json")],
                                        name=value["type"], last_chunk=True)
 
         async def trace(node: str, phase: str, **details: Any) -> None:
@@ -109,12 +110,13 @@ class CommentaryExecutor(AgentExecutor):
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
+                        message = safe_error(exc)
                         observed_text = getattr(exc, "observed_text", "")
                         observed_chunks = getattr(exc, "audio_chunks", 0)
                         observed_samples = getattr(exc, "samples", 0)
                         turn = turn.model_copy(update={"spoken_text": observed_text if observed_chunks else None,
-                                                       "speech_complete": False, "speech_error": str(exc)})
-                        await emit({"type": "error", "data": {"stage": "speech", "message": str(exc),
+                                                       "speech_complete": False, "speech_error": message})
+                        await emit({"type": "error", "data": {"stage": "speech", "message": message,
                                                                    "text_fallback": observed_chunks == 0,
                                                                    "observed_text": observed_text, "turn_id": turn.id}})
                         await emit({"type": "segment.sealed", "data": {"turn_id": turn.id, "segment_id": turn.id,
@@ -159,13 +161,20 @@ class CommentaryExecutor(AgentExecutor):
                             checkpoint_thread=task_id)
                 return {"stage": "completed"}
 
+            def safe_node(handler):
+                async def run(state):
+                    try:
+                        return await handler(state)
+                    except Exception as exc:
+                        # LangGraph records failed node errors in checkpoint writes.
+                        # Sanitize before the exception reaches that persistence layer.
+                        raise RuntimeError(safe_error(exc)) from None
+                return run
+
             graph = StateGraph(AgentState)
-            graph.add_node("validate_snapshot", validate)
-            graph.add_node("generate", generate)
-            graph.add_node("speak", speech)
-            graph.add_node("publish", publish)
-            graph.add_node("peer_exchange", peer)
-            graph.add_node("persist", finalize)
+            for name, handler in [("validate_snapshot", validate), ("generate", generate), ("speak", speech),
+                                  ("publish", publish), ("peer_exchange", peer), ("persist", finalize)]:
+                graph.add_node(name, safe_node(handler))
             graph.add_edge(START, "validate_snapshot")
             graph.add_edge("validate_snapshot", "generate")
             graph.add_edge("generate", "speak")
@@ -184,9 +193,11 @@ class CommentaryExecutor(AgentExecutor):
             # The official request handler invokes cancel() after cancelling execute.
             raise
         except Exception as exc:
-            logger.exception("agent_task_failed", extra={"agent_id": self.persona.id, "task_id": task_id})
-            await emit({"type": "error", "data": {"stage": "agent", "message": str(exc)}})
-            await updater.failed(updater.new_agent_message([Part(text=str(exc))]))
+            message = safe_error(exc)
+            logger.error("agent_task_failed: %s", message,
+                         extra={"agent_id": self.persona.id, "task_id": task_id, "error_type": type(exc).__name__})
+            await emit({"type": "error", "data": {"stage": "agent", "message": message}})
+            await updater.failed(updater.new_agent_message([Part(text=message)]))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         if context.task_id and context.context_id:

@@ -14,6 +14,7 @@ from a2a.types import CancelTaskRequest, Message, Role, SendMessageRequest, Task
 from google.protobuf.json_format import MessageToDict
 
 from backend.contracts import AgentRequest, CommentaryTurn, uid
+from backend.security import redact
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -33,20 +34,24 @@ async def exchange(url: str, payload: AgentRequest, emit: Emit,
     seen_artifacts: set[str] = set()
     received_ids: set[str] = set()
     task_known = asyncio.Event()
+    remote_error: str | None = None
 
     async def artifact(value: Any) -> None:
+        nonlocal remote_error
         if value.artifact_id in seen_artifacts:
             return
         seen_artifacts.add(value.artifact_id)
         for part in value.parts:
             if not part.HasField("data"):
                 continue
-            app_event = MessageToDict(part.data)
+            app_event = redact(MessageToDict(part.data))
             if not isinstance(app_event.get("type"), str) or not isinstance(app_event.get("data"), dict):
                 raise ValueError("Invalid commentary artifact received from A2A agent")
             app_event["data"].setdefault("task_id", task_id)
             app_event["data"].setdefault("exchange_id", payload.exchange_id)
             app_event["data"].setdefault("snapshot_hash", payload.snapshot.hash)
+            if app_event["type"] == "error" and isinstance(app_event["data"].get("message"), str):
+                remote_error = app_event["data"]["message"]
             if app_event["type"] == "turn":
                 turn = CommentaryTurn.model_validate(app_event["data"]["turn"])
                 if turn.snapshot_hash != payload.snapshot.hash or turn.exchange_id != payload.exchange_id:
@@ -101,7 +106,8 @@ async def exchange(url: str, payload: AgentRequest, emit: Emit,
                     if state == TaskState.TASK_STATE_COMPLETED:
                         remote_terminal = True
                 if failed_state is not None:
-                    raise RuntimeError(f"Agent task {task_id} ended with {TaskState.Name(failed_state)}")
+                    detail = f": {remote_error}" if remote_error else ""
+                    raise RuntimeError(f"Agent task {task_id} ended with {TaskState.Name(failed_state)}{detail}")
 
             consumer = asyncio.create_task(consume())
             waiter = asyncio.create_task(cancel_event.wait()) if cancel_event else None

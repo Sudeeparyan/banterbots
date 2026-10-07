@@ -1,5 +1,6 @@
 """Protocol tests use two real HTTP services, never in-process peer mocks."""
 import asyncio
+import json
 import socket
 import sqlite3
 
@@ -12,6 +13,7 @@ from backend.a2a_client import exchange
 from backend.agents import create_app
 from backend.commentary import Draft, demo_draft, load_persona, validate_draft, validate_request
 from backend.contracts import AgentRequest, CommentaryTurn, GameSnapshot, PlayEvent, uid
+from backend.security import safe_error
 
 
 def request(**changes):
@@ -97,6 +99,79 @@ async def test_changed_snapshot_is_rejected_over_protocol(agents):
         await exchange(urls[0], payload, emit)
     assert any("integrity" in event["data"].get("message", "").lower() for event in events)
     assert not any(event["type"] == "turn" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_invalid_key_failure_stays_actionable_and_private_over_protocol(agents, monkeypatch, caplog):
+    from openai import AuthenticationError
+    from backend import agents as agent_module
+
+    secret = "sk-proj-testsecretthatmustnotbepersisted"
+    response = httpx.Response(401, request=httpx.Request("POST", "https://api.openai.com/v1/responses"))
+    failure = AuthenticationError(f"Incorrect API key provided: {secret}", response=response,
+                                  body={"code": "invalid_api_key", "type": "invalid_request_error"})
+
+    async def rejected(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(agent_module, "generate_turn", rejected)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    with pytest.raises(RuntimeError, match="FAILED.*Replace the key in .env.*all three") as raised:
+        await exchange(agents[0][0], request(provider="openai"), emit)
+    assert safe_error(failure) in str(raised.value)
+    assert any(event["type"] == "error" and event["data"]["message"] == safe_error(failure) for event in events)
+    assert not any(event["type"] == "turn" for event in events)
+    assert secret not in str(raised.value) + json.dumps(events) + caplog.text
+
+    # Both A2A records and LangGraph's failed-node checkpoint writes are durable.
+    for suffix in ("tasks", "checkpoints"):
+        with sqlite3.connect(agents[2] / "a" / f"agent_a_{suffix}.sqlite") as db:
+            records = "\n".join(db.iterdump())
+        assert secret not in records
+        assert secret.encode().hex().upper() not in records.upper()
+
+
+@pytest.mark.asyncio
+async def test_speech_authentication_failure_checkpoint_uses_safe_message(agents, monkeypatch):
+    from openai import AuthenticationError
+    from backend import agents as agent_module
+    from backend.speech import SpeechFailure
+
+    secret = "sk-proj-testsecretinspeechcheckpoint"
+    response = httpx.Response(401, request=httpx.Request("POST", "https://api.openai.com/v1/realtime"))
+    failure = AuthenticationError(f"Incorrect API key provided: {secret}", response=response,
+                                  body={"code": "invalid_api_key"})
+
+    async def drafted(payload, persona, task_id, emit):
+        return CommentaryTurn(exchange_id=payload.exchange_id, agent_id=persona.id, persona=persona.name,
+                              team_id=payload.snapshot.event.home_team if persona.id == "a" else payload.snapshot.event.away_team,
+                              event_id=payload.snapshot.event.id, snapshot_hash=payload.snapshot.hash,
+                              text="A grounded call.", mode="openai", task_id=task_id,
+                              reply_to_turn_id=payload.peer_utterance.id if payload.peer_utterance else None)
+
+    async def rejected(*args, **kwargs):
+        raise SpeechFailure(str(failure)) from failure
+
+    monkeypatch.setattr(agent_module, "generate_turn", drafted)
+    monkeypatch.setattr(agent_module, "speak", rejected)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    payload = request(provider="openai").model_copy(update={"voice_enabled": True})
+    turns = await exchange(agents[0][0], payload, emit)
+    assert all(turn.speech_complete is False and turn.speech_error == safe_error(failure) for turn in turns)
+    assert secret not in json.dumps(events)
+    for agent_id in ("a", "b"):
+        with sqlite3.connect(agents[2] / agent_id / f"agent_{agent_id}_checkpoints.sqlite") as db:
+            records = "\n".join(db.iterdump())
+        assert secret not in records
+        assert secret.encode().hex().upper() not in records.upper()
 
 
 @pytest.mark.asyncio

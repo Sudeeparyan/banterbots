@@ -60,6 +60,14 @@ OPENAI_VOICE_MODEL=gpt-live-1
 
 Select **OpenAI commentary** in the dashboard. The text model prepares short factual calls and replies. Your requested `gpt-live-1` delivers the spoken commentary through the server. Keys stay on the Python services.
 
+The dashboard's **key configured** label confirms that the services loaded a key; it does not verify that OpenAI accepts it. Use an API key created for your OpenAI project, and restart all three Python services after editing `.env`. A ChatGPT login token is not an API key. To check actual text commentary and peer replies with the running services:
+
+```powershell
+.\.venv\Scripts\python.exe tools/smoke.py --provider openai
+```
+
+This makes billed API calls and keeps voice disabled. An invalid key, missing model access, or exhausted quota produces a failed check with the reason. Check voice separately using the dashboard's speaker control.
+
 Personas are editable manifests under `personas/`. Max supports the home team; Riley supports the away team. The personalities use original identities and distinct stock voices. Validated `demo_delivery` settings control offline pace (`punchy` or `measured`), an ordered `analysis_focus` list (`situation`, `field_position`, `recent_sequence`, `score`), and `banter_frequency` from 0 to 0.6. Restart the Python services after editing manifests.
 
 GPT-Live uses fresh sessions for bounded utterances. The next agent receives the lead's finalized observed speech transcript. The browser serializes audio segments and acknowledges playback. Caption timing is approximate, and streamed speech may paraphrase a draft. Once credentials are configured, listen to representative scoring, turnover, penalty, reversed-play and quiet-period examples before presenting model-driven broadcast quality.
