@@ -1,0 +1,94 @@
+{
+  "about": "Stadium layers for the broadcast soundscape. start/end trim each file (seconds); gain_db brings the trimmed region to target_lufs and is written by tools/measure_loudness.mjs --manifest. Sources and licenses: LICENSES.md.",
+  "layers": {
+    "bed": {
+      "file": "crowd/college-football-crowd.mp3",
+      "start": 3,
+      "end": 28,
+      "loop": true,
+      "target_lufs": -20,
+      "measured_lufs": -12.2,
+      "gain_db": -7.8
+    },
+    "roar": {
+      "file": "crowd/goal-reaction-roar.mp3",
+      "start": 3.8,
+      "end": 14,
+      "target_lufs": -20,
+      "measured_lufs": -13,
+      "gain_db": -7
+    },
+    "roar_alt": {
+      "file": "crowd/roaring-crowd.mp3",
+      "start": 0.2,
+      "end": 7,
+      "target_lufs": -20,
+      "measured_lufs": -16.5,
+      "gain_db": -3.5
+    },
+    "cheer": {
+      "file": "crowd/crowd-cheer.mp3",
+      "start": 0,
+      "end": 9,
+      "target_lufs": -20,
+      "measured_lufs": -8.6,
+      "gain_db": -11.4
+    },
+    "pocket": {
+      "file": "crowd/crowd-cheer-2.mp3",
+      "start": 0.5,
+      "end": 10,
+      "target_lufs": -20,
+      "measured_lufs": -12.4,
+      "gain_db": -7.6
+    },
+    "groan": {
+      "file": "crowd/crowd-oh-disappointed.mp3",
+      "start": 0,
+      "end": 1.9,
+      "target_lufs": -20,
+      "measured_lufs": -12.3,
+      "gain_db": -7.7
+    },
+    "boo": {
+      "file": "crowd/sport-crowd-booing.mp3",
+      "start": 1,
+      "end": 12,
+      "target_lufs": -20,
+      "measured_lufs": -14.8,
+      "gain_db": -5.2
+    }
+  },
+  "stingers": {
+    "intro": {
+      "file": "stingers/intro.wav",
+      "target_lufs": -20,
+      "measured_lufs": -20.4,
+      "gain_db": 0.4
+    },
+    "quarter": {
+      "file": "stingers/quarter.wav",
+      "target_lufs": -20,
+      "measured_lufs": -16.6,
+      "gain_db": -3.4
+    },
+    "halftime": {
+      "file": "stingers/halftime.wav",
+      "target_lufs": -20,
+      "measured_lufs": -19.6,
+      "gain_db": -0.4
+    },
+    "final": {
+      "file": "stingers/final.wav",
+      "target_lufs": -20,
+      "measured_lufs": -19.8,
+      "gain_db": -0.2
+    },
+    "score": {
+      "file": "stingers/score.wav",
+      "target_lufs": -20,
+      "measured_lufs": -18,
+      "gain_db": -2
+    }
+  }
+}

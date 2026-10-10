@@ -14,12 +14,13 @@ def engine():
 
 
 @pytest.mark.asyncio
-async def test_alternation_and_immutable_snapshot(monkeypatch):
+async def test_intro_segment_then_possession_lead_with_immutable_snapshots(monkeypatch):
     host = engine()
     observed = []
 
     async def fake_exchange(url, payload, emit, cancel):
-        observed.append((url, payload.snapshot.hash, payload.snapshot.event.home_score))
+        observed.append((url, payload.snapshot.hash, payload.snapshot.event.home_score, payload.mode,
+                         payload.snapshot.phase, payload.topic))
         for agent in ("a", "b"):
             turn = CommentaryTurn(exchange_id=payload.exchange_id, agent_id=agent, persona=agent,
                 team_id=payload.snapshot.event.home_team if agent == "a" else payload.snapshot.event.away_team,
@@ -32,12 +33,15 @@ async def test_alternation_and_immutable_snapshot(monkeypatch):
     await host.one(session, session.replay[0])
     snapshot_a = session.snapshot
     await host.one(session, session.replay[1])
-    assert observed[0][0].endswith("8001")
-    assert observed[1][0].endswith("8002")
+    # The opening "play" is the home host's intro segment, sealed for the same frozen event.
+    assert observed[0][0].endswith("8001") and observed[0][3:] == ("segment", "segment", "intro")
+    # Baltimore receives the opening kickoff, so Riley (the away voice) calls it.
+    assert observed[1][0].endswith("8002") and observed[1][3:] == ("exchange", "result", None)
     assert len(session.turns) == 4
     assert snapshot_a["event"]["home_score"] == observed[0][2] == 0
-    assert snapshot_a["hash"] == observed[0][1]
+    assert snapshot_a["event"]["id"] == session.replay[0].id
     assert all(t["snapshot_hash"] == observed[0][1] for t in session.turns[:2])
+    assert session.snapshot["hash"] == observed[1][1]
     await host.provider.aclose()
 
 

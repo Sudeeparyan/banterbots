@@ -6,9 +6,11 @@ export function reduceEvent(session: Session, event: RunEvent): Session {
   if (event.seq <= (session.seq ?? 0)) return session;
   let next = event.epoch > session.epoch ? { ...session, epoch: event.epoch } : session;
   if (next.events.some((e) => e.seq === event.seq)) return next;
+  // Audio is played straight from the socket. Keeping PCM chunks here would
+  // evict the protocol traces that explain each exchange from the window.
   next = {
     ...next,
-    events: [...next.events.slice(-499), event],
+    events: event.type === 'audio' ? next.events : [...next.events.slice(-499), event],
     seq: Math.max(next.seq ?? 0, event.seq),
   };
   if (event.type === 'snapshot') next.snapshot = event.data.snapshot as Snapshot;

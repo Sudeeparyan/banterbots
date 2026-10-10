@@ -11,6 +11,7 @@ from typing import Any, TypedDict
 import structlog
 from langgraph.graph import END, START, StateGraph
 
+from backend.commentary import game_stats, presnap_event
 from backend.config import AGENT_A_URL, AGENT_B_URL
 from backend.contracts import AgentRequest, Game, GameSnapshot, PlayEvent, RunEvent, SessionCreate, now, uid
 from backend.journal import Journal
@@ -18,6 +19,15 @@ from backend.providers import ESPNProvider, get_replay_events, get_replay_games
 from backend.security import redact
 
 log = structlog.get_logger()
+# Snaps that get a pre-snap setup line in replay (nflverse situations are pre-snap).
+SETUP_KINDS = {"run", "pass", "punt", "field_goal", "qb_kneel", "qb_spike", "no_play"}
+FRAME_KINDS = ("game_start", "period_end", "game_end")
+MEMORY_SIZE = 12
+
+
+def public_poll(poll: dict | None) -> dict | None:
+    """A poll as listeners may see it: never the result the studio already knows."""
+    return {key: value for key, value in poll.items() if key != "converted"} if poll else None
 
 
 @dataclass
@@ -43,14 +53,28 @@ class Broadcast:
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     playback: dict[str, asyncio.Event] = field(default_factory=dict)
     last_segment: str | None = None
+    # The newest segment sent to the browser; screen events wait until it has been heard.
+    screen_after: str | None = None
+    # Pre-snap setups still being spoken, by the exchange that calls their play.
+    setup_runs: dict[str, dict] = field(default_factory=dict)
+    # The next play's setup, started while this play's reply is on air.
+    prefetch: asyncio.Task | None = None
     history_start_seq: int = 0
     seen: dict[str, PlayEvent] = field(default_factory=dict)
     pending: list[PlayEvent] = field(default_factory=list)
     commented_revisions: dict[str, int] = field(default_factory=dict)
     emit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Remarks worth calling back to and predictions with their outcomes; causal by construction.
+    memory: list[dict] = field(default_factory=list)
+    # The listener's side, reactions since the last play, poll vote and queued questions.
+    listener: dict = field(default_factory=lambda: {"side": None, "cheers": 0, "boos": 0, "poll": None,
+                                                    "questions": [], "resolved_poll": None})
+    # Segments whose playback the listener actually completed.
+    heard: set[str] = field(default_factory=set)
 
     def view(self):
         return {"id": self.id, "epoch": self.epoch, "game": self.game.model_dump(),
+                "listener": {"side": self.listener.get("side"), "poll": public_poll(self.listener.get("poll"))},
                 "mode": self.config.mode, "provider": self.config.provider, "status": self.status,
                 "speed": self.config.speed, "index": self.index, "total": len(self.replay),
                 "date": self.config.date,
@@ -81,11 +105,13 @@ class Engine:
         self.lifecycle = asyncio.Lock()
         self.restore_lock = asyncio.Lock()
         graph = StateGraph(GraphState)
-        for name, handler in [("normalize", self.normalize), ("snapshot", self.make_snapshot),
-                              ("choose_lead", self.choose_lead), ("a2a_exchange", self.agent_exchange),
+        for name, handler in [("normalize", self.normalize), ("choose_lead", self.choose_lead),
+                              ("setup", self.setup), ("snapshot", self.make_snapshot),
+                              ("a2a_exchange", self.agent_exchange), ("segments", self.segments),
                               ("finalize", self.finalize)]:
             graph.add_node(name, handler)
-        names = [START, "normalize", "snapshot", "choose_lead", "a2a_exchange", "finalize", END]
+        # The pre-snap setup is generated and published before the play's result snapshot.
+        names = [START, "normalize", "choose_lead", "setup", "snapshot", "a2a_exchange", "segments", "finalize", END]
         for left, right in zip(names, names[1:]):
             graph.add_edge(left, right)
         self.graph = graph.compile(checkpointer=checkpointer)
@@ -100,6 +126,10 @@ class Engine:
         if epoch is not None and epoch != session.epoch:
             return
         data = redact(data)
+        if kind != "audio" and session.screen_after and "present_after" not in data:
+            # The next play is prepared while this one is heard: the browser shows
+            # results and captions only after the audio they follow has played.
+            data = {**data, "present_after": session.screen_after}
         session.seq += 1
         event = RunEvent(seq=session.seq, session_id=session.id, epoch=session.epoch, type=kind, data=data)
         encoded = event.model_dump()
@@ -169,7 +199,9 @@ class Engine:
         saved = await self.journal.get(sid)
         if not saved:
             raise KeyError(sid)
-        config = SessionCreate(game_id=saved["game"]["id"], mode=saved["mode"], provider=saved["provider"],
+        # Runs saved before the Azure OpenAI switch recorded the provider as "openai".
+        provider = "azure" if saved["provider"] == "openai" else saved["provider"]
+        config = SessionCreate(game_id=saved["game"]["id"], mode=saved["mode"], provider=provider,
                                speed=saved["speed"], start_index=saved.get("start_index", 0),
                                voice_enabled=saved.get("voice_enabled", True), date=saved.get("date"))
         session = Broadcast(id=sid, config=config, game=Game.model_validate(saved["game"]),
@@ -236,6 +268,7 @@ class Engine:
         session.cancel.set()
         session.epoch += 1
         session.status = status
+        self.drop_setups(session)
         if session.task and not session.task.done():
             session.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -267,6 +300,9 @@ class Engine:
                 session.index = session.config.start_index
                 session.exchanges = 0
                 session.turns.clear()
+                session.memory.clear()
+                session.heard.clear()
+                session.screen_after = None
                 session.history_start_seq = session.seq + 1
                 session.seen.clear()
                 session.commented_revisions.clear()
@@ -293,11 +329,8 @@ class Engine:
                         "revision": event.revision, "source": event.source}, state["epoch"])
         return {"play": event.model_dump()}
 
-    async def make_snapshot(self, state):
-        session = self.sessions[state["session_id"]]
-        if state["epoch"] != session.epoch:
-            raise asyncio.CancelledError
-        event = PlayEvent.model_validate(state["play"])
+    def context(self, session, event: PlayEvent) -> tuple[list[dict], list[dict]]:
+        """Earlier plays and earlier dialogue only; an interrupted, unheard line is not context."""
         if session.config.mode == "live":
             # Joining a game seeds observed context, while a queued older play
             # must never see later plays already received by the poller.
@@ -315,31 +348,73 @@ class Engine:
         known = session.seen.values() if session.config.mode == "live" else session.replay
         sequence_by_id = {play.id: play.sequence for play in known}
         recent_turns = [turn for turn in session.turns
-                        if sequence_by_id.get(turn["event_id"], event.sequence + 1) <= event.sequence][-8:]
-        snapshot = GameSnapshot(event=event, drive_history=history, recent_turns=recent_turns).seal()
+                        if sequence_by_id.get(turn["event_id"], event.sequence + 1) <= event.sequence
+                        and not (turn.get("interrupted") and turn["event_id"] == event.id)][-8:]
+        return history, recent_turns
+
+    def booth(self, session, event: PlayEvent, phase: str, topic: str | None = None) -> dict:
+        """Booth memory, listener input and (for segments) totals of plays already completed."""
+        booth: dict = {}
+        if session.memory:
+            booth["memory"] = session.memory[-MEMORY_SIZE:]
+        listener = session.listener
+        poll = listener.get("poll")
+        if poll and "converted" in poll and poll.get("pick"):
+            listener["resolved_poll"] = {"question": poll.get("question"), "pick": poll["pick"],
+                                         "outcome": "right" if (poll["pick"] == "convert") == poll["converted"] else "wrong"}
+            listener["poll"] = None
+        heard = {key: listener[key] for key in ("side", "cheers", "boos") if listener.get(key)}
+        if listener.get("resolved_poll"):
+            heard["poll"] = listener["resolved_poll"]
+        if topic == "listener_question" and listener.get("asking"):
+            heard["question"] = listener["asking"]
+        if heard:
+            booth["listener"] = heard
+        if phase == "segment":
+            known = sorted(session.seen.values(), key=lambda play: play.sequence) if session.config.mode == "live" else session.replay
+            booth["stats"] = game_stats(list(known), event)
+        return booth
+
+    async def make_snapshot(self, state):
+        session = self.sessions[state["session_id"]]
+        if state["epoch"] != session.epoch:
+            raise asyncio.CancelledError
+        event = PlayEvent.model_validate(state["play"])
+        history, recent_turns = self.context(session, event)
+        snapshot = GameSnapshot(event=event, drive_history=history, recent_turns=recent_turns,
+                                booth=self.booth(session, event, "result")).seal()
         session.snapshot = snapshot.model_dump()
         await self.emit(session, "snapshot", {"snapshot": session.snapshot}, state["epoch"])
         await self.emit(session, "trace", {"node": "snapshot", "phase": "complete", "snapshot_hash": snapshot.hash}, state["epoch"])
         return {"snapshot": session.snapshot}
 
+    @staticmethod
+    def framing(event: PlayEvent) -> bool:
+        return any(kind in event.play_type.lower() for kind in FRAME_KINDS) or event.description.strip().upper() == "GAME"
+
+    def lead_for(self, session, event: PlayEvent) -> str:
+        """Whoever's team has the ball calls the play-by-play; framing moments alternate."""
+        team = event.offense_team or event.possession
+        if team in {event.home_team, event.away_team} and not self.framing(event):
+            return "a" if team == event.home_team else "b"
+        return "a" if session.exchanges % 2 == 0 else "b"
+
     async def choose_lead(self, state):
         session = self.sessions[state["session_id"]]
-        lead = "a" if session.exchanges % 2 == 0 else "b"
+        lead = self.lead_for(session, PlayEvent.model_validate(state["play"]))
         await self.emit(session, "trace", {"node": "choose_lead", "phase": "complete", "lead": lead,
                                           "exchange_id": state["exchange_id"]}, state["epoch"])
         return {"lead": lead}
 
-    async def agent_exchange(self, state):
-        from backend.a2a_client import exchange
-
-        session = self.sessions[state["session_id"]]
+    def forwarder(self, session, state, reply_on_air: asyncio.Event | None = None):
         epoch = state["epoch"]
-        session.last_segment = None
 
         async def forward(item):
             if epoch != session.epoch:
                 return
             kind, data = item["type"], redact(item.get("data", {}))
+            if kind == "audio" and reply_on_air is not None and data.get("agent_id") not in (None, state.get("lead")):
+                reply_on_air.set()
             if kind == "caption.delta" and (data.get("delta") or data.get("text")):
                 session.metrics.setdefault("first_text_ms", round((time.perf_counter() - state["started"]) * 1000))
             if kind == "turn":
@@ -347,22 +422,288 @@ class Engine:
                 if not any(t["id"] == turn["id"] for t in session.turns):
                     session.turns.append(turn)
                     session.last_segment = turn["id"]
+                    session.screen_after = turn["id"]
                     session.playback.setdefault(turn["id"], asyncio.Event())
                     session.metrics.setdefault("first_text_ms", round((time.perf_counter() - state["started"]) * 1000))
             if kind == "segment.sealed":
                 session.last_segment = data["segment_id"]
+                session.screen_after = data["segment_id"]
                 session.playback.setdefault(data["segment_id"], asyncio.Event())
             if kind == "audio":
                 session.metrics.setdefault("first_audio_ms", round((time.perf_counter() - state["started"]) * 1000))
             await self.emit(session, kind, data, epoch)
 
+        return forward
+
+    def remember(self, session, turns) -> None:
+        """Keep remarks a host marked as worth a callback, and every prediction."""
+        for turn in turns:
+            if not (turn.bit or turn.prediction):
+                continue
+            session.memory.append({"id": f"m{len(session.memory) + 1}", "agent_id": turn.agent_id, "persona": turn.persona,
+                                   "text": turn.spoken_text or turn.text, "bit": turn.bit, "prediction": turn.prediction,
+                                   "event_id": turn.event_id})
+        del session.memory[:-40]
+
+    def resolve(self, session, event: PlayEvent) -> None:
+        """Score predictions and the listener's poll once the play's result is known."""
+        flags = set(event.flags)
+        converted = bool(flags & {"first_down", "touchdown"}) and not flags & {"reversed", "no_play", "play_deleted"}
+        for item in session.memory:
+            if item.get("event_id") == event.id and item.get("prediction") and "outcome" not in item:
+                expected = {"convert": converted, "stopped": not converted, "score": "scoring" in flags}.get(item["prediction"])
+                if expected is not None:
+                    item["outcome"] = "right" if expected else "wrong"
+        poll = session.listener.get("poll")
+        if poll and poll.get("event_id") == event.id:
+            # The studio knows the result now, but the listener may still be hearing the
+            # setup line: votes stay open, and the next break scores them.
+            poll["converted"] = converted
+
+    def wants_setup(self, session, event: PlayEvent) -> bool:
+        if session.config.mode != "replay" or event.source != "nflverse" or event.down not in (1, 2, 3, 4):
+            return False
+        if event.play_type not in SETUP_KINDS:
+            return False
+        speed = session.config.speed
+        critical = event.down in (3, 4) or (event.yardline is not None and event.yardline <= 20)
+        return speed <= 2 or (speed <= 4 and critical)
+
+    async def setup(self, state):
+        """A pre-snap line from a snapshot that cannot contain the result.
+
+        The line is written and spoken while the call is written: the graph moves on as
+        soon as the setup's voice segment exists, and the result waits behind it.
+        """
+        session = self.sessions[state["session_id"]]
+        if state["epoch"] != session.epoch:
+            raise asyncio.CancelledError
+        session.last_segment = None
+        event = PlayEvent.model_validate(state["play"])
+        run = await self.adopt_prefetch(session, event, state["epoch"])
+        if run is None:
+            if not self.wants_setup(session, event):
+                return {}
+            run = await self.start_setup(session, state["epoch"], event, state["lead"])
+        session.setup_runs[state["exchange_id"]] = run
+        await run["written"].wait()
+        if run.get("segment"):
+            # The result, its captions and its poll result appear once the setup has been heard.
+            session.screen_after = run["segment"]
+        return {}
+
+    async def start_setup(self, session, epoch: int, event: PlayEvent, lead: str) -> dict:
+        """Open the poll and send the pre-snap line; returns at once with the running exchange."""
+        from backend.a2a_client import exchange
+
+        previous = max((play for play in session.replay if play.sequence < event.sequence),
+                       key=lambda play: play.sequence, default=None)
+        history, recent_turns = self.context(session, event)
+        snapshot = GameSnapshot(event=presnap_event(event, previous), drive_history=history, recent_turns=recent_turns,
+                                phase="pre_snap", booth=self.booth(session, event, "pre_snap")).seal()
+        payload = AgentRequest(session_id=session.id, epoch=epoch, exchange_id=uid(), snapshot=snapshot,
+                               provider=session.config.provider, voice_enabled=session.config.voice_enabled,
+                               mode="setup", hop_budget=0)
+        if event.down in (3, 4):
+            # A prediction poll for the listener, open while the setup is heard.
+            question = "Do they convert?"
+            session.listener["poll"] = {"event_id": event.id, "question": question, "pick": None}
+            await self.emit(session, "poll.open", {"event_id": event.id, "question": question,
+                                                  "options": [{"id": "convert", "label": "They convert"},
+                                                              {"id": "stopped", "label": "They're stopped"}],
+                                                  "down": event.down, "distance": event.distance}, epoch)
+        run: dict = {"event_id": event.id, "epoch": epoch, "lead": lead, "exchange_id": payload.exchange_id,
+                     "written": asyncio.Event(), "segment": None}
+        base = self.forwarder(session, {"epoch": epoch, "lead": lead, "started": time.perf_counter()})
+
+        async def forward(item):
+            if item.get("type") == "turn.start" and not run["written"].is_set():
+                run["segment"] = item.get("data", {}).get("segment_id")
+                run["written"].set()
+            await base(item)
+
+        async def speak() -> list:
+            try:
+                turns = await asyncio.wait_for(exchange(AGENT_A_URL if lead == "a" else AGENT_B_URL, payload,
+                                                        forward, session.cancel), timeout=45)
+                if epoch == session.epoch:
+                    self.remember(session, turns)
+                return turns
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception as exc:
+                # The setup is atmosphere; the play itself must still be called.
+                await self.emit(session, "trace", {"node": "setup", "phase": "skipped", "event_id": event.id,
+                                                  "reason": redact(str(exc))}, epoch)
+                return []
+            finally:
+                run["written"].set()
+
+        run["task"] = asyncio.create_task(speak())
+        return run
+
+    async def adopt_prefetch(self, session, event: PlayEvent, epoch: int) -> dict | None:
+        """Take over the setup started during the previous play's reply, if it is for this play."""
+        task, session.prefetch = session.prefetch, None
+        if task is None:
+            return None
+        try:
+            run = await task
+        except (asyncio.CancelledError, Exception):
+            return None
+        if run is None or run["event_id"] != event.id or run["epoch"] != epoch:
+            if run is not None:
+                run["task"].cancel()
+            return None
+        return run
+
+    def drop_setups(self, session) -> None:
+        """Cancel setups still in flight; anything they published is marked as cut."""
+        runs = list(session.setup_runs.values())
+        session.setup_runs.clear()
+        if session.prefetch is not None:
+            session.prefetch.cancel()
+            session.prefetch = None
+        for run in runs:
+            run["task"].cancel()
+
+    def next_play(self, session, event: PlayEvent) -> PlayEvent | None:
+        if session.config.mode != "replay":
+            return None
+        index = next((i for i, play in enumerate(session.replay) if play.id == event.id), None)
+        return session.replay[index + 1] if index is not None and index + 1 < len(session.replay) else None
+
+    async def prefetch_setup(self, session, epoch: int, event: PlayEvent, upcoming: PlayEvent,
+                             on_air: asyncio.Event, exchanged: asyncio.Task) -> dict | None:
+        """Start the next play's setup once this play's reply is on air, so no silence follows it."""
+        waiter = asyncio.create_task(on_air.wait())
+        try:
+            await asyncio.wait({waiter, exchanged}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            waiter.cancel()
+        if epoch != session.epoch or (exchanged.done() and (exchanged.cancelled() or exchanged.exception())):
+            return None
+        # This play's result is settled: its poll is scored before the next one opens.
+        self.resolve(session, event)
+        await self.emit(session, "trace", {"node": "setup", "phase": "prefetch", "event_id": upcoming.id}, epoch)
+        return await self.start_setup(session, epoch, upcoming, self.lead_for(session, upcoming))
+
+    def wants_prefetch(self, session, event: PlayEvent) -> PlayEvent | None:
+        """Only a voiced, playing replay prepares ahead, and never past a segment that must come first."""
+        if (session.status != "playing" or session.config.provider != "azure" or not session.config.voice_enabled
+                or self.segment_topics(session, event)):
+            return None
+        upcoming = self.next_play(session, event)
+        return upcoming if upcoming and not self.framing(upcoming) and self.wants_setup(session, upcoming) else None
+
+    def segment_topics(self, session, event: PlayEvent) -> list[str]:
+        """Between-play talk the completed play makes natural; fewer at high replay speed."""
+        kind = event.play_type.lower()
+        flags = set(event.flags)
+        speed = session.config.speed
+        topics: list[str] = []
+        if event.description.strip().upper() == "GAME" or "game_start" in kind:
+            topics.append("intro")
+        elif "game_end" in kind:
+            topics.append("final")
+        elif "period_end" in kind and event.quarter in (1, 2, 3):
+            topics.append("halftime" if event.quarter == 2 else "quarter")
+        elif speed <= 2 and event.drive is not None:
+            ended = (kind in {"extra_point", "field_goal", "punt"} or "two_point" in kind
+                     or bool(flags & {"interception", "fumble_lost", "safety"})
+                     or (event.down == 4 and kind in {"run", "pass"} and not flags & {"first_down", "touchdown", "penalty"}))
+            if ended:
+                known = session.replay if session.config.mode == "replay" else list(session.seen.values())
+                drive = game_stats(sorted(known, key=lambda play: play.sequence), event).get("drive", {})
+                if drive.get("plays", 0) >= 4 or flags & {"interception", "fumble_lost"} or kind in {"extra_point", "field_goal"} or "two_point" in kind:
+                    topics.append("drive_summary")
+        if (session.listener.get("questions") and speed <= 4 and "intro" not in topics
+                and session.prefetch is None):
+            topics.append("listener_question")
+        return topics
+
+    def segment_lead(self, session, event: PlayEvent, topic: str) -> str:
+        if topic == "intro":
+            return "a"
+        if topic == "listener_question":
+            side = session.listener.get("side")
+            return "a" if side == "home" else "b" if side == "away" else ("a" if session.exchanges % 2 == 0 else "b")
+        if topic == "drive_summary":
+            drive_team = event.offense_team or event.possession
+            return "b" if drive_team == event.home_team else "a"
+        if event.home_score != event.away_score:
+            return "a" if event.home_score < event.away_score else "b"
+        return "a" if session.exchanges % 2 == 0 else "b"
+
+    async def segments(self, state):
+        from backend.a2a_client import exchange
+
+        session = self.sessions[state["session_id"]]
+        if state["epoch"] != session.epoch:
+            raise asyncio.CancelledError
+        event = PlayEvent.model_validate(state["play"])
+        turns = list(state.get("turns", []))
+        for topic in self.segment_topics(session, event):
+            if topic == "listener_question":
+                session.listener["asking"] = session.listener["questions"].pop(0)
+            history, recent_turns = self.context(session, event)
+            snapshot = GameSnapshot(event=event, drive_history=history, recent_turns=recent_turns, phase="segment",
+                                    booth=self.booth(session, event, "segment", topic)).seal()
+            payload = AgentRequest(session_id=session.id, epoch=state["epoch"], exchange_id=uid(), snapshot=snapshot,
+                                   provider=session.config.provider, voice_enabled=session.config.voice_enabled,
+                                   mode="segment", topic=topic)
+            lead = self.segment_lead(session, event, topic)
+            try:
+                produced = await asyncio.wait_for(exchange(AGENT_A_URL if lead == "a" else AGENT_B_URL, payload,
+                                                           self.forwarder(session, state), session.cancel), timeout=90)
+                self.remember(session, produced)
+                turns.extend(turn.model_dump() for turn in produced)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception as exc:
+                await self.emit(session, "trace", {"node": "segments", "phase": "skipped", "topic": topic,
+                                                  "reason": redact(str(exc))}, state["epoch"])
+            finally:
+                session.listener.pop("asking", None)
+        return {"turns": turns}
+
+    async def agent_exchange(self, state):
+        from backend.a2a_client import exchange
+
+        session = self.sessions[state["session_id"]]
+        epoch = state["epoch"]
+        event = PlayEvent.model_validate(state["play"])
+        if self.framing(event):
+            # Game start, quarter ends and the final whistle are segments, not play calls.
+            self.resolve(session, event)
+            return {"turns": []}
+        on_air = asyncio.Event()
+        forward = self.forwarder(session, state, on_air)
         payload = AgentRequest(session_id=session.id, epoch=epoch, exchange_id=state["exchange_id"],
                                snapshot=GameSnapshot.model_validate(state["snapshot"]), provider=session.config.provider,
                                voice_enabled=session.config.voice_enabled)
         await self.emit(session, "trace", {"node": "a2a_exchange", "phase": "start", "from": "coordinator",
                         "to": state["lead"], "snapshot_hash": payload.snapshot.hash}, epoch)
-        turns = await asyncio.wait_for(exchange(AGENT_A_URL if state["lead"] == "a" else AGENT_B_URL,
-                                    payload, forward, session.cancel), timeout=90)
+        exchanged = asyncio.create_task(asyncio.wait_for(exchange(AGENT_A_URL if state["lead"] == "a" else AGENT_B_URL,
+                                                                  payload, forward, session.cancel), timeout=90))
+        upcoming = self.wants_prefetch(session, event)
+        if upcoming is not None and session.prefetch is None:
+            session.prefetch = asyncio.create_task(self.prefetch_setup(session, epoch, event, upcoming, on_air, exchanged))
+        setup = session.setup_runs.pop(state["exchange_id"], None)
+        try:
+            turns = await exchanged
+            if setup is not None:
+                # Spoken before the call (one voice per host), so this is already settled.
+                await setup["task"]
+        except BaseException:
+            exchanged.cancel()
+            if setup is not None:
+                setup["task"].cancel()
+            raise
+        self.remember(session, turns)
+        self.resolve(session, event)
+        # Reactions answered by this play are spent; new ones gather for the next.
+        session.listener.update(cheers=0, boos=0)
         await self.emit(session, "trace", {"node": "a2a_exchange", "phase": "complete",
                         "exchange_id": state["exchange_id"], "snapshot_hash": payload.snapshot.hash,
                         "turn_count": len(turns)}, epoch)
@@ -391,15 +732,16 @@ class Engine:
                  "exchange_id": uid(), "started": time.perf_counter()}
         await self.graph.ainvoke(state, {"configurable": {"thread_id": f"{session.id}:{session.epoch}"}})
 
-    async def wait_playback(self, session):
-        if session.player and session.config.voice_enabled and session.last_segment:
-            event = session.playback.setdefault(session.last_segment, asyncio.Event())
+    async def wait_playback(self, session, segment: str | None = None):
+        segment = segment or session.last_segment
+        if session.player and session.config.voice_enabled and segment:
+            event = session.playback.setdefault(segment, asyncio.Event())
             try:
                 # The acknowledgement is for the peer, after both utterances.
                 # Browser voices may legitimately take 25 seconds each.
                 await asyncio.wait_for(event.wait(), timeout=60)
             except TimeoutError:
-                await self.emit(session, "trace", {"node": "playback", "phase": "timeout", "segment_id": session.last_segment})
+                await self.emit(session, "trace", {"node": "playback", "phase": "timeout", "segment_id": segment})
 
     async def live_poll(self, session):
         epoch = session.epoch
@@ -463,12 +805,16 @@ class Engine:
         current = None
         prior_turns = len(session.turns)
         consumed = False
+        # The last segment of the previous play: the next play is prepared while
+        # this one is heard, but never more than one play ahead of the listener.
+        ahead: str | None = None
         try:
             if session.config.mode == "live":
                 poller = asyncio.create_task(self.live_poll(session))
             while not session.cancel.is_set():
                 if session.config.mode == "replay":
                     if session.index >= len(session.replay):
+                        await self.wait_playback(session, ahead)
                         session.status = "completed"
                         break
                     event = session.replay[session.index]
@@ -495,9 +841,9 @@ class Engine:
                     finished = finished or (session.config.mode == "live" and session.game.status == "final" and not session.pending)
                     session.status = "completed" if finished else "paused"
                     break
-                await self.wait_playback(session)
-                if session.config.mode == "replay":
-                    await asyncio.sleep(max(0.5, 4 / session.config.speed))
+                if ahead:
+                    await self.wait_playback(session, ahead)
+                ahead = session.last_segment
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -507,7 +853,16 @@ class Engine:
         finally:
             if current and not consumed:
                 published = session.turns[prior_turns:]
-                if published:
+                unheard = session.config.mode == "replay" and not any(turn["id"] in session.heard for turn in published)
+                if published and unheard:
+                    # Prepared ahead but never played: keep the transcript, mark it cut,
+                    # and call the play again on resume rather than skipping it.
+                    for turn in published:
+                        turn["interrupted"] = True
+                    await self.emit(session, "trace", {"node": "recovery", "phase": "unheard",
+                                    "event_id": current.id, "published_turns": len(published),
+                                    "message": "Prepared commentary was never played; the play resumes from its start."})
+                elif published:
                     if session.config.mode == "live":
                         session.commented_revisions[current.id] = current.revision
                     # Preserve audible history and explicitly consume an interrupted

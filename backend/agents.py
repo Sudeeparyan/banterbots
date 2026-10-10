@@ -24,12 +24,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from backend.a2a_client import exchange
-from backend.commentary import generate_turn, load_persona, validate_request
+from backend.a2a_client import draft_reply, exchange
+from backend.commentary import fact_issue, generate_turn, load_persona, ready_for_reply, validate_request
 from backend.config import AGENT_A_URL, AGENT_B_URL, RUNTIME
-from backend.contracts import AgentRequest, CommentaryTurn
+from backend.contracts import AgentRequest, CommentaryTurn, ReplyDraft
 from backend.security import redact, safe_error
-from backend.speech import speak
+from backend.speech import VoiceBooth
 
 logger = logging.getLogger("banterbots.agent")
 
@@ -42,11 +42,28 @@ class AgentState(TypedDict, total=False):
     stage: str
 
 
+class TranscriptTaskStore(DatabaseTaskStore):
+    """Durable A2A tasks without transient PCM; audio artifacts still stream to the caller.
+
+    The SDK re-saves the whole task after every artifact. Persisting each audio chunk
+    made writes grow quadratically within a turn and stalled live speech relays.
+    """
+
+    async def save(self, task: Task, context) -> None:
+        if any(artifact.name == "audio" for artifact in task.artifacts):
+            kept = [artifact for artifact in task.artifacts if artifact.name != "audio"]
+            task = Task(id=task.id, context_id=task.context_id, status=task.status, history=task.history,
+                        metadata=task.metadata, artifacts=kept)
+        await super().save(task, context)
+
+
 class CommentaryExecutor(AgentExecutor):
     def __init__(self, agent_id: str, peer_url: str):
         self.persona = load_persona(agent_id)
         self.peer_url = peer_url
         self.checkpointer: AsyncSqliteSaver | None = None
+        # One GPT-Live line per host, reused across turns when the session mode allows.
+        self.booth = VoiceBooth(self.persona.name, self.persona.id, self.persona.voice)
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         if not context.task_id or not context.context_id or not context.message:
@@ -60,6 +77,7 @@ class CommentaryExecutor(AgentExecutor):
                                               history=[context.message]))
         await updater.start_work()
         request: AgentRequest | None = None
+        pending: dict[str, asyncio.Task] = {}
 
         async def emit(value: dict[str, Any]) -> None:
             data = value.setdefault("data", {})
@@ -91,25 +109,117 @@ class CommentaryExecutor(AgentExecutor):
                             facts=request.snapshot.model_dump())
                 return {"snapshot_hash": request.snapshot.hash, "stage": "validated"}
 
+            voiced = request.provider == "azure" and request.voice_enabled
+
+            async def draft_traces(value: dict[str, Any]) -> None:
+                # The partner's drafting is visible in traces; its draft returns to this agent only.
+                if value.get("type") == "trace":
+                    value["data"]["draft"] = True
+                    await emit(value)
+
+            published = asyncio.Event()
+            early_segments: dict[str, str] = {}
+
+            async def early_events(value: dict[str, Any]) -> None:
+                # An early reply streams its voice while this line ends; its finished turn follows this one.
+                data = value.get("data", {})
+                if value.get("type") == "turn.start":
+                    early_segments[str(data.get("segment_id"))] = str(data.get("agent_id"))
+                if value.get("type") == "turn":
+                    await published.wait()
+                await emit(value)
+
+            async def drafted() -> ReplyDraft | None:
+                if "draft" not in pending:
+                    return None
+                try:
+                    # Usually finished while this line was spoken.
+                    return await asyncio.wait_for(asyncio.shield(pending["draft"]), 8)
+                except Exception as exc:
+                    pending.pop("draft").cancel()
+                    await trace("peer_exchange", "draft_unavailable", reason=safe_error(exc))
+                    return None
+
+            async def reply(utterance: CommentaryTurn, relay) -> list[CommentaryTurn]:
+                peer_request = request.model_copy(update={"mode": "reply", "hop_budget": 0, "draft": await drafted(),
+                                                           "peer_utterance": utterance})
+                # Awaiting a real streaming HTTP call means the peer's observed speech
+                # and task identifiers are forwarded to the coordinator, not invented.
+                timeout = 60 if request.provider == "azure" else 15
+                return await asyncio.wait_for(exchange(self.peer_url, peer_request, relay), timeout=timeout)
+
+            async def withdraw_early(reason: str) -> None:
+                early = pending.pop("reply", None)
+                if early is None:
+                    return
+                early.cancel()
+                await asyncio.gather(early, return_exceptions=True)
+                for segment_id, agent_id in list(early_segments.items()):
+                    # The browser drops whatever it has not yet played of the withdrawn reply,
+                    # sealed or not; a segment it already finished ignores this.
+                    await emit({"type": "segment.sealed", "data": {"turn_id": segment_id, "segment_id": segment_id,
+                                                                    "agent_id": agent_id, "chunks": 0, "samples": 0,
+                                                                    "total_samples": 0, "boundary": "withdrawn",
+                                                                    "finalized": False, "discard_audio": True,
+                                                                    "browser_speech": False, "speech_complete": False}})
+                early_segments.clear()
+                await trace("peer_exchange", "early_withdrawn", reason=reason)
+
             async def generate(state: AgentState) -> AgentState:
                 started = time.perf_counter()
+                if voiced:
+                    # Open (or keep) the voice line while the text model drafts.
+                    self.booth.prewarm()
                 await trace("generate", "start", persona=self.persona.name)
                 turn = await generate_turn(request, self.persona, task_id, emit)
                 await trace("generate", "complete", latency_ms=round((time.perf_counter() - started) * 1000, 1))
+                if request.mode == "draft":
+                    draft = ReplyDraft(text=turn.text, emotion=turn.emotion, basis=request.peer_utterance.text,
+                                       callback_to=turn.callback_to, bit=turn.bit, evidence=["partner"])
+                    await emit({"type": "draft", "data": {"draft": draft.model_dump(mode="json")}})
+                    return {"own_turn": turn.model_dump(mode="json"), "stage": "drafted"}
+                if request.mode in {"exchange", "segment"} and voiced:
+                    # The partner writes its reply while this line is spoken; it is used only if the
+                    # spoken words carry the facts it answered, which the partner checks.
+                    draft_request = request.model_copy(update={"mode": "draft", "hop_budget": 0, "peer_utterance": turn})
+                    pending["draft"] = asyncio.create_task(draft_reply(self.peer_url, draft_request, draft_traces))
                 await emit({"type": "turn.start", "data": {"turn_id": turn.id, "segment_id": turn.id,
                                                                 "agent_id": turn.agent_id, "persona": turn.persona,
                                                                 "team_id": turn.team_id, "voice": turn.voice,
-                                                                "mode": turn.mode}})
+                                                                "mode": turn.mode,
+                                                                "event_revision": request.snapshot.event.revision,
+                                                                "delivery": turn.delivery.model_dump(mode="json") if turn.delivery else None}})
                 return {"own_turn": turn.model_dump(mode="json"), "stage": "generated"}
 
             async def speech(state: AgentState) -> AgentState:
                 turn = CommentaryTurn.model_validate(state["own_turn"])
-                if request.provider == "openai" and request.voice_enabled:
+                if request.mode == "draft":
+                    return {"stage": "drafted"}
+                if voiced:
+                    script = turn
+
+                    async def progress(transcript: str) -> None:
+                        if (request.mode not in {"exchange", "segment"} or "reply" in pending
+                                or not ready_for_reply(request, script.text, transcript)):
+                            return
+                        # Every fact is heard: the partner starts answering while the last words play.
+                        heard = script.model_copy(update={"spoken_text": transcript.strip(), "speech_complete": False})
+                        await trace("peer_exchange", "early", heard=heard.spoken_text)
+                        pending["reply"] = asyncio.create_task(reply(heard, early_events))
+
                     try:
-                        turn = await speak(request, turn, emit)
+                        turn = await self.booth.speak(request, turn, emit, on_progress=progress)
+                        issue = fact_issue(turn.spoken_text or "", request)
+                        if issue:
+                            # The voice ad-libbed a fact the script did not contain; the partner corrects it.
+                            turn = turn.model_copy(update={"fact_flag": issue})
+                            await trace("speak", "fact_flag", turn_id=turn.id, reason=issue,
+                                        spoken=turn.spoken_text, script=turn.text)
+                            await withdraw_early("misspoken")
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
+                        await withdraw_early("speech_failed")
                         message = safe_error(exc)
                         observed_text = getattr(exc, "observed_text", "")
                         observed_chunks = getattr(exc, "audio_chunks", 0)
@@ -133,25 +243,28 @@ class CommentaryExecutor(AgentExecutor):
 
             async def publish(state: AgentState) -> AgentState:
                 turn = CommentaryTurn.model_validate(state["own_turn"])
+                if request.mode == "draft":
+                    return {"turns": [], "stage": "drafted"}
                 await emit({"type": "turn", "data": {"turn": turn.model_dump(mode="json")}})
+                published.set()
                 if request.provider == "demo" or not request.voice_enabled:
                     await emit({"type": "segment.sealed", "data": {"turn_id": turn.id, "segment_id": turn.id,
                                                                         "agent_id": turn.agent_id, "chunks": 0,
                                                                         "samples": 0, "total_samples": 0,
                                                                         "transcript": turn.text, "text": turn.text,
                                                                         "browser_speech": request.provider == "demo" and request.voice_enabled,
+                                                                        "delivery": turn.delivery.model_dump(mode="json") if turn.delivery else None,
                                                                         "voice": turn.voice, "finalized": True,
                                                                         "boundary": "browser_speech" if request.voice_enabled else "text_only"}})
                 return {"turns": [turn.model_dump(mode="json")], "stage": "published"}
 
             async def peer(state: AgentState) -> AgentState:
-                await trace("peer_exchange", "start", source_agent=self.persona.id, target=self.peer_url)
-                peer_request = request.model_copy(update={"mode": "reply", "hop_budget": 0,
-                                                           "peer_utterance": CommentaryTurn.model_validate(state["own_turn"])})
-                # Awaiting a real streaming HTTP call means the peer's observed speech
-                # and task identifiers are forwarded to the coordinator, not invented.
-                timeout = 60 if request.provider == "openai" else 15
-                turns = await asyncio.wait_for(exchange(self.peer_url, peer_request, emit), timeout=timeout)
+                await trace("peer_exchange", "start", source_agent=self.persona.id, target=self.peer_url,
+                            early="reply" in pending)
+                if "reply" in pending:
+                    turns = await pending["reply"]
+                else:
+                    turns = await reply(CommentaryTurn.model_validate(state["own_turn"]), emit)
                 await trace("peer_exchange", "complete", peer_tasks=[turn.task_id for turn in turns],
                             matching_snapshot=all(turn.snapshot_hash == request.snapshot.hash for turn in turns))
                 return {"turns": state["turns"] + [turn.model_dump(mode="json") for turn in turns], "stage": "peer_completed"}
@@ -179,7 +292,8 @@ class CommentaryExecutor(AgentExecutor):
             graph.add_edge("validate_snapshot", "generate")
             graph.add_edge("generate", "speak")
             graph.add_edge("speak", "publish")
-            graph.add_conditional_edges("publish", lambda state: "peer_exchange" if request.mode == "exchange" else "persist")
+            graph.add_conditional_edges("publish", lambda state: "peer_exchange" if request.mode in {"exchange", "segment"}
+                                        else "persist")
             graph.add_edge("peer_exchange", "persist")
             graph.add_edge("persist", END)
             workflow = graph.compile(checkpointer=self.checkpointer)
@@ -198,6 +312,12 @@ class CommentaryExecutor(AgentExecutor):
                          extra={"agent_id": self.persona.id, "task_id": task_id, "error_type": type(exc).__name__})
             await emit({"type": "error", "data": {"stage": "agent", "message": message}})
             await updater.failed(updater.new_agent_message([Part(text=message)]))
+        finally:
+            for task in pending.values():
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending.values(), return_exceptions=True)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         if context.task_id and context.context_id:
@@ -213,7 +333,7 @@ def create_app(agent_id: str = "a", port: int | None = None, peer_url: str | Non
     runtime.mkdir(parents=True, exist_ok=True)
     executor = CommentaryExecutor(agent_id, peer_url or (AGENT_B_URL if agent_id == "a" else AGENT_A_URL))
     engine = create_async_engine(f"sqlite+aiosqlite:///{(runtime / f'agent_{agent_id}_tasks.sqlite').as_posix()}")
-    store = DatabaseTaskStore(engine)
+    store = TranscriptTaskStore(engine)
     card = AgentCard(name=executor.persona.name, description=f"Original {executor.persona.allegiance}-team NFL commentator.",
                      version="1.0.0", capabilities=AgentCapabilities(streaming=True),
                      supported_interfaces=[AgentInterface(url=f"http://127.0.0.1:{port}/a2a/jsonrpc",
@@ -231,6 +351,7 @@ def create_app(agent_id: str = "a", port: int | None = None, peer_url: str | Non
             try:
                 yield
             finally:
+                await executor.booth.close()
                 await handler.aclose()
                 executor.checkpointer = None
         await engine.dispose()

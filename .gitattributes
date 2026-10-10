@@ -1,2 +1,5 @@
 # Preserve replay provenance hashes across Windows and Linux checkouts.
 data/*.json text eol=lf
+# Audio is hashed in frontend/public/audio/LICENSES.md; never convert it.
+*.mp3 binary
+*.wav binary

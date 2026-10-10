@@ -52,6 +52,54 @@ export type Snapshot = {
   drive_history: Record<string, unknown>[];
   recent_turns: Record<string, unknown>[];
 };
+export type VocalDelivery = {
+  energy: number;
+  pace: 'steady' | 'brisk' | 'deliberate';
+  contour:
+    | 'steady'
+    | 'lift_and_settle'
+    | 'stunned_drop'
+    | 'dry_lilt'
+    | 'suspense'
+    | 'warm_close'
+    | 'explode'
+    | 'groan'
+    | 'build';
+  browser_rate: number;
+  browser_pitch: number;
+  browser_volume: number;
+  pause_before_ms: number;
+  sound_cue:
+    | 'none'
+    | 'crowd_swell'
+    | 'crowd_roar'
+    | 'crowd_gasp'
+    | 'crowd_build'
+    | 'crowd_cheer'
+    | 'crowd_groan'
+    | 'crowd_boo';
+  cue_intensity: number;
+  // Newer plans only; saved runs from before the stadium rewrite omit them.
+  crowd_side?: 'home' | 'neutral';
+  away_pocket?: number;
+  stinger?: 'none' | 'intro' | 'quarter' | 'halftime' | 'final' | 'score';
+  overlap_ms?: number;
+  moment?: Moment;
+  reason:
+    | 'ordinary'
+    | 'explosive'
+    | 'conversion'
+    | 'touchdown'
+    | 'turnover'
+    | 'ruling'
+    | 'reset'
+    | 'score'
+    | 'late_tension'
+    | 'stop'
+    | 'setup'
+    | 'segment';
+};
+export type Moment = 'setup' | 'routine' | 'notable' | 'big' | 'ruling' | 'reset' | 'segment';
 export type Turn = {
   id: string;
   exchange_id: string;
@@ -66,9 +114,25 @@ export type Turn = {
   emotion: string;
   created_at: string;
   voice: string;
-  mode: 'demo' | 'openai';
+  mode: 'demo' | 'azure';
   reply_to_turn_id: string | null;
   task_id: string | null;
+  delivery?: VocalDelivery | null;
+  topic?: string | null;
+  callback_to?: string | null;
+  bit?: string | null;
+  prediction?: string | null;
+  fact_flag?: string | null;
+  interrupted?: boolean;
+};
+export type Poll = {
+  event_id: string;
+  question: string;
+  pick?: 'convert' | 'stopped' | null;
+};
+export type ListenerState = {
+  side?: 'home' | 'away' | 'neutral' | null;
+  poll?: Poll | null;
 };
 export type RunEvent = {
   seq: number;
@@ -94,7 +158,7 @@ export type Session = {
   created_at?: string;
   game: Game;
   mode: 'live' | 'replay';
-  provider: 'demo' | 'openai';
+  provider: 'demo' | 'azure';
   status: string;
   speed: number;
   index: number;
@@ -104,12 +168,14 @@ export type Session = {
   events: RunEvent[];
   feed: Feed;
   metrics: Record<string, number | null>;
+  listener?: ListenerState;
 };
 export type Config = {
-  openai_configured: boolean;
+  azure_configured: boolean;
   text_model: string;
   voice_model: string;
   a2a_version: string;
+  agent_urls?: { a: string; b: string };
   personas: { agent_id: 'a' | 'b'; name: string; style: string; voice: string }[];
 };
 export type SavedRun = {

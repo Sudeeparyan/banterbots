@@ -107,7 +107,7 @@ async def test_invalid_key_failure_stays_actionable_and_private_over_protocol(ag
     from backend import agents as agent_module
 
     secret = "sk-proj-testsecretthatmustnotbepersisted"
-    response = httpx.Response(401, request=httpx.Request("POST", "https://api.openai.com/v1/responses"))
+    response = httpx.Response(401, request=httpx.Request("POST", "https://example-resource.openai.azure.com/openai/v1/responses"))
     failure = AuthenticationError(f"Incorrect API key provided: {secret}", response=response,
                                   body={"code": "invalid_api_key", "type": "invalid_request_error"})
 
@@ -121,7 +121,7 @@ async def test_invalid_key_failure_stays_actionable_and_private_over_protocol(ag
         events.append(event)
 
     with pytest.raises(RuntimeError, match="FAILED.*Replace the key in .env.*all three") as raised:
-        await exchange(agents[0][0], request(provider="openai"), emit)
+        await exchange(agents[0][0], request(provider="azure"), emit)
     assert safe_error(failure) in str(raised.value)
     assert any(event["type"] == "error" and event["data"]["message"] == safe_error(failure) for event in events)
     assert not any(event["type"] == "turn" for event in events)
@@ -142,7 +142,7 @@ async def test_speech_authentication_failure_checkpoint_uses_safe_message(agents
     from backend.speech import SpeechFailure
 
     secret = "sk-proj-testsecretinspeechcheckpoint"
-    response = httpx.Response(401, request=httpx.Request("POST", "https://api.openai.com/v1/realtime"))
+    response = httpx.Response(401, request=httpx.Request("POST", "https://example-resource.openai.azure.com/openai/v1/live/sessions"))
     failure = AuthenticationError(f"Incorrect API key provided: {secret}", response=response,
                                   body={"code": "invalid_api_key"})
 
@@ -150,20 +150,20 @@ async def test_speech_authentication_failure_checkpoint_uses_safe_message(agents
         return CommentaryTurn(exchange_id=payload.exchange_id, agent_id=persona.id, persona=persona.name,
                               team_id=payload.snapshot.event.home_team if persona.id == "a" else payload.snapshot.event.away_team,
                               event_id=payload.snapshot.event.id, snapshot_hash=payload.snapshot.hash,
-                              text="A grounded call.", mode="openai", task_id=task_id,
+                              text="A grounded call.", mode="azure", task_id=task_id,
                               reply_to_turn_id=payload.peer_utterance.id if payload.peer_utterance else None)
 
     async def rejected(*args, **kwargs):
         raise SpeechFailure(str(failure)) from failure
 
     monkeypatch.setattr(agent_module, "generate_turn", drafted)
-    monkeypatch.setattr(agent_module, "speak", rejected)
+    monkeypatch.setattr(agent_module.VoiceBooth, "speak", rejected)
     events = []
 
     async def emit(event):
         events.append(event)
 
-    payload = request(provider="openai").model_copy(update={"voice_enabled": True})
+    payload = request(provider="azure").model_copy(update={"voice_enabled": True})
     turns = await exchange(agents[0][0], payload, emit)
     assert all(turn.speech_complete is False and turn.speech_error == safe_error(failure) for turn in turns)
     assert secret not in json.dumps(events)
@@ -254,6 +254,88 @@ async def test_cancellation_during_peer_generation_stops_both_services(agents, m
     assert len(published) <= 1 and all(agent_id == "a" for agent_id in published)
 
 
+def early_reply_fakes(monkeypatch, lead_fails=False):
+    """Lead and partner voices with no GPT-Live: the lead reports its words as they are heard."""
+    from backend import agents as agent_module
+    from backend.speech import SpeechFailure
+
+    script = "Flowers for 12. First down, Ravens, and they keep on rolling."
+    heard = "Flowers for twelve. First down, Ravens, and they"
+    replies, partner_speaking = [], asyncio.Event()
+
+    async def drafted(payload, persona, task_id, emit):
+        event = payload.snapshot.event
+        return CommentaryTurn(exchange_id=payload.exchange_id, agent_id=persona.id, persona=persona.name,
+                              team_id=event.home_team if persona.id == "a" else event.away_team, event_id=event.id,
+                              snapshot_hash=payload.snapshot.hash, mode="azure", task_id=task_id,
+                              text=script if payload.peer_utterance is None else "Twelve more, Max. Keep counting.",
+                              reply_to_turn_id=payload.peer_utterance.id if payload.peer_utterance else None)
+
+    async def speak(self, payload, turn, emit, on_progress=None, **_):
+        if payload.mode == "reply":
+            replies.append(payload.peer_utterance)
+            partner_speaking.set()
+            if lead_fails and len(replies) == 1:
+                await asyncio.Event().wait()  # withdrawn before it finishes
+        else:
+            await on_progress("Flowers for twelve.")
+            await asyncio.sleep(0.05)
+            assert not partner_speaking.is_set()  # facts heard, but most of the line is still to come
+            await on_progress(heard)
+            await asyncio.wait_for(partner_speaking.wait(), 5)  # the partner starts before this line ends
+            if lead_fails:
+                await asyncio.sleep(0.3)
+                raise SpeechFailure("voice dropped")
+        await emit({"type": "segment.sealed", "data": {"turn_id": turn.id, "segment_id": turn.id, "agent_id": turn.agent_id,
+                                                        "chunks": 1, "samples": 2, "total_samples": 2,
+                                                        "boundary": "script_complete", "finalized": True}})
+        return turn.model_copy(update={"spoken_text": turn.text, "speech_complete": True})
+
+    monkeypatch.setattr(agent_module, "generate_turn", drafted)
+    monkeypatch.setattr(agent_module.VoiceBooth, "speak", speak)
+    monkeypatch.setattr(agent_module.VoiceBooth, "prewarm", lambda self: None)
+    return heard, replies
+
+
+@pytest.mark.asyncio
+async def test_partner_reply_starts_while_the_last_words_play_and_publishes_after_the_call(agents, monkeypatch):
+    heard, replies = early_reply_fakes(monkeypatch)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    payload = request(provider="azure").model_copy(update={"voice_enabled": True})
+    turns = await exchange(agents[0][0], payload, emit)
+    assert [turn.agent_id for turn in turns] == ["a", "b"] and turns[1].reply_to_turn_id == turns[0].id
+    # The partner answered the words heard so far, which already carried every fact.
+    assert len(replies) == 1 and replies[0].spoken_text == heard and replies[0].speech_complete is False
+    assert turns[0].spoken_text == turns[0].text  # the published call is the complete line
+    published = [event["data"]["turn"]["agent_id"] for event in events if event["type"] == "turn"]
+    assert published == ["a", "b"]
+    assert any(event["data"].get("phase") == "early" for event in events if event["type"] == "trace")
+
+
+@pytest.mark.asyncio
+async def test_early_reply_is_withdrawn_and_discarded_when_the_call_fails(agents, monkeypatch):
+    _, replies = early_reply_fakes(monkeypatch, lead_fails=True)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    payload = request(provider="azure").model_copy(update={"voice_enabled": True})
+    turns = await exchange(agents[0][0], payload, emit)
+    starts = [event["data"]["segment_id"] for event in events if event["type"] == "turn.start" and event["data"]["agent_id"] == "b"]
+    withdrawn = [event["data"] for event in events if event["type"] == "segment.sealed" and event["data"].get("boundary") == "withdrawn"]
+    assert len(starts) == 2 and [seal["segment_id"] for seal in withdrawn] == [starts[0]]
+    assert withdrawn[0]["discard_audio"] is True and withdrawn[0]["agent_id"] == "b"
+    # The replacement reply answers the failed call's observed words, not the withdrawn draft.
+    assert len(replies) == 2 and replies[1].spoken_text is None
+    assert [turn.agent_id for turn in turns] == ["a", "b"] and turns[0].speech_complete is False
+    assert turns[1].id == starts[1]
+
+
 @pytest.mark.parametrize("description,kind,flags,expected", [
     ("P.Mahomes pass incomplete short middle.", "pass", ["incomplete_pass"], "incomplete"),
     ("L.Jackson pass intercepted by J.Reid.", "pass", ["interception", "turnover"], "intercept"),
@@ -282,7 +364,8 @@ def test_reply_engages_completed_observed_words():
                           text="Draft that wasn't spoken.", spoken_text="Flowers picks up twelve yards. Useful gain.")
     payload = payload.model_copy(update={"mode": "reply", "hop_budget": 0, "peer_utterance": peer})
     draft = demo_draft(payload, load_persona("b"))
-    assert "12 yards" in draft.text and "Max" in draft.text
+    assert "Useful is the word" in draft.text and "Max" in draft.text
+    assert "12 yards" not in draft.text  # Pick up the actual point instead of re-reading the lead.
     assert "Draft" not in draft.text
     changed = payload.model_copy(update={"peer_utterance": peer.model_copy(update={"spoken_text": "Keep working, Ravens."})})
     assert demo_draft(changed, load_persona("b")).text != draft.text
@@ -351,19 +434,115 @@ def test_return_touchdown_does_not_mistake_offensive_actor_for_scorer(flags):
     "Touchdown Ravens!",
     "Flowers picks up 7 yards.",
 ])
-def test_openai_draft_rejects_unfounded_numeric_scores_and_results(text):
+def test_azure_draft_rejects_unfounded_numeric_scores_and_results(text):
     draft = Draft(text=text, emotion="engaged", evidence=["event.description"])
     with pytest.raises(ValueError):
         validate_draft(draft, request(), load_persona("a"))
 
 
-def test_openai_draft_accepts_current_facts_and_corrected_touchdown_denial():
+def test_azure_draft_accepts_current_facts_and_corrected_touchdown_denial():
     payload = request()
     validate_draft(Draft(text="Jackson finds Flowers for 12 yards.", emotion="engaged", evidence=["event.description"]),
                    payload, load_persona("a"))
     payload.snapshot.event.flags = ["reversed", "incomplete_pass"]
     validate_draft(Draft(text="No touchdown. The call was reversed.", emotion="reflective", evidence=["event.flags"]),
                    payload, load_persona("a"))
+
+
+def test_azure_draft_accepts_supplied_analysis_options_evidence_only():
+    payload = request()
+    payload.snapshot.event.flags = ["touchdown", "scoring"]
+    persona = load_persona("a")
+    validate_draft(Draft(text="Flowers gets in.", emotion="excited",
+                         evidence=["event.description", "analysis_options.score"]), payload, persona)
+    with pytest.raises(ValueError, match="outside the snapshot"):
+        validate_draft(Draft(text="Flowers gets in.", emotion="excited",
+                             evidence=["analysis_options.recent_sequence"]), payload, persona)
+
+
+@pytest.mark.parametrize("path", ["snapshot.event.description", "drive_history[4].description",
+                                  "snapshot.drive_history[3].description", "partner.text", "event.flags[0]"])
+def test_azure_draft_accepts_equivalent_citations_of_supplied_fields(path):
+    validate_draft(Draft(text="Jackson finds Flowers.", emotion="engaged", evidence=[path]),
+                   request(), load_persona("a"))
+
+
+@pytest.mark.asyncio
+async def test_task_store_persists_transcripts_but_not_transient_audio(tmp_path):
+    from a2a.helpers.proto_helpers import new_data_part
+    from a2a.server.context import ServerCallContext
+    from a2a.types import Artifact, Task, TaskState, TaskStatus
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from backend.agents import TranscriptTaskStore
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'tasks.sqlite').as_posix()}")
+    store = TranscriptTaskStore(engine)
+    await store.initialize()
+    task = Task(id="t", context_id="c", status=TaskStatus(state=TaskState.TASK_STATE_WORKING), artifacts=[
+        Artifact(artifact_id="1", name="audio", parts=[new_data_part({"pcm_base64": "AAAA"})]),
+        Artifact(artifact_id="2", name="segment.sealed", parts=[new_data_part({"transcript": "Henry scores."})])])
+    context = ServerCallContext()
+    await store.save(task, context)
+    saved = await store.get("t", context)
+    await engine.dispose()
+    assert [artifact.name for artifact in saved.artifacts] == ["segment.sealed"]
+    assert saved.status.state == TaskState.TASK_STATE_WORKING
+    assert len(task.artifacts) == 2
+
+
+class QueuedDrafts:
+    """Stand-in Azure client whose Responses API returns queued drafts in order."""
+
+    def __init__(self, drafts):
+        self.drafts, self.instructions = list(drafts), []
+        self.responses = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def parse(self, *, instructions, **_):
+        self.instructions.append(instructions)
+        draft = self.drafts.pop(0)
+        return type("Response", (), {"output_parsed": draft, "id": "resp", "usage": None})()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_drafts, succeeds", [(1, True), (2, True), (3, False)])
+async def test_azure_regenerates_fact_check_rejections_with_reason(monkeypatch, bad_drafts, succeeds):
+    from backend import commentary
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+    bad = Draft(text="Jackson gains 99 yards.", emotion="engaged", evidence=["event.description"])
+    good = Draft(text="Jackson finds Flowers for 12 yards.", emotion="engaged", evidence=["event.description"])
+    client = QueuedDrafts([bad] * bad_drafts + [good])
+    monkeypatch.setattr(commentary, "azure_client", lambda **_: client)
+    traces = []
+
+    async def emit(item):
+        traces.append(item["data"])
+
+    payload = request(provider="azure")
+    if succeeds:
+        turn = await commentary.generate_turn(payload, load_persona("a"), "task", emit)
+        assert turn.text == good.text
+    else:
+        # Three rejected drafts: the grounded template line airs instead, never the rejected text.
+        turn = await commentary.generate_turn(payload, load_persona("a"), "task", emit)
+        assert turn.text == demo_draft(payload, load_persona("a")).text and "99" not in turn.text
+        assert any(trace.get("phase") == "fallback" and "numeric facts" in trace["reason"] for trace in traces)
+    rejected = [trace for trace in traces if trace.get("phase") == "rejected"]
+    assert [trace["attempt"] for trace in rejected] == list(range(1, min(bad_drafts, commentary.DRAFT_ATTEMPTS) + 1))
+    assert "numeric facts" in client.instructions[1] and "99 yards" in client.instructions[1]
+
+
+@pytest.mark.parametrize("path", ["event.coverage", "snapshot.weather", "derived_facts.win_probability", "season_stats"])
+def test_azure_draft_rejects_citations_of_unsupplied_fields(path):
+    with pytest.raises(ValueError, match="outside the snapshot"):
+        validate_draft(Draft(text="Jackson finds Flowers.", emotion="engaged", evidence=[path]),
+                       request(), load_persona("a"))
 
 
 def test_all_bundled_replays_keep_short_original_leads_and_replies():

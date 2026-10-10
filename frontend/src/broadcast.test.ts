@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { exchangesFor, nflDate, transcriptFor } from './broadcast';
+import { exchangesFor, nflDate, transcriptFor, turnLabel } from './broadcast';
 import type { Session, Snapshot, Turn } from './types';
 
 const snapshot = (hash: string, score: number) =>
@@ -72,5 +72,18 @@ describe('broadcast conversation', () => {
     expect(groups[0].snapshot).toBeUndefined();
     expect(groups[0].turns).toHaveLength(2);
     expect(exchangesFor(null)).toEqual([]);
+  });
+  it('keeps a pre-snap setup on its play card and labels each role', () => {
+    const setup = { ...turn('0', 'setup-exchange', 'pre-snap', 'Third and 11.'), kind: 'setup' };
+    const groups = exchangesFor({ ...run, turns: [setup, ...run.turns] });
+    expect(groups.map((group) => group.turns.map((item) => item.id))).toEqual([
+      ['0', '1', '2'],
+      ['3'],
+    ]);
+    expect(groups[0].snapshot?.event.away_score).toBe(26);
+    expect(turnLabel(setup)).toBe('SETUP');
+    expect(turnLabel({ ...run.turns[0], kind: 'segment', topic: 'halftime' })).toBe('HALFTIME');
+    expect(turnLabel({ ...run.turns[0], reply_to_turn_id: '1' })).toBe('REPLY');
+    expect(turnLabel(run.turns[0])).toBe('CALL');
   });
 });

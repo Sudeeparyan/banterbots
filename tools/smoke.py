@@ -11,18 +11,18 @@ async def verify(base, provider="demo"):
     async with httpx.AsyncClient(base_url=base, timeout=15, trust_env=False) as client:
         health = (await client.get("/api/health")).json()
         assert health["status"] == "ok", f"Agents are unavailable: {health}"
-        if provider == "openai":
+        if provider == "azure":
             config = (await client.get("/api/config")).json()
-            if not config["openai_configured"]:
-                raise RuntimeError("The running services have no OpenAI key. Add OPENAI_API_KEY to .env "
-                                   "and restart all three Python services.")
+            if not config["azure_configured"]:
+                raise RuntimeError("The running services have no Azure OpenAI credentials. Add AZURE_OPENAI_API_KEY "
+                                   "and AZURE_OPENAI_ENDPOINT to .env and restart all three Python services.")
         response = await client.post("/api/sessions", json={"voice_enabled": False, "provider": provider})
         response.raise_for_status()
         session = response.json()
         for step in range(2):
             response = await client.post(f"/api/sessions/{session['id']}/control", json={"action": "step"})
             response.raise_for_status()
-            deadline = asyncio.get_running_loop().time() + (120 if provider == "openai" else 15)
+            deadline = asyncio.get_running_loop().time() + (120 if provider == "azure" else 15)
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.1)
                 response = await client.get(f"/api/sessions/{session['id']}")
@@ -55,8 +55,8 @@ async def verify(base, provider="demo"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--provider", choices=["demo", "openai"], default="demo",
-                        help="OpenAI verifies two real text exchanges using the server's key (billed API calls)")
+    parser.add_argument("--provider", choices=["demo", "azure"], default="demo",
+                        help="Azure verifies two real text exchanges using the server's Azure OpenAI key (billed API calls)")
     args = parser.parse_args()
     try:
         asyncio.run(verify(args.base_url, args.provider))

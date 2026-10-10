@@ -1,7 +1,7 @@
 """Dashboard API, run journal and ordered browser streams."""
 import asyncio
 import contextlib
-import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -12,10 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from backend.config import AGENT_A_URL, AGENT_B_URL, ROOT, RUNTIME, TEXT_MODEL, VOICE_MODEL
+from backend.config import AGENT_A_URL, AGENT_B_URL, ROOT, RUNTIME, TEXT_MODEL, VOICE_MODEL, azure_configured
 from backend.commentary import load_persona
-from backend.contracts import SessionControl, SessionCreate, uid
-from backend.engine import Engine
+from backend.contracts import ListenerInput, SessionControl, SessionCreate, uid
+from backend.engine import Engine, public_poll
 from backend.journal import Journal
 from backend.providers import get_replay_games, get_replay_highlights, get_teams
 
@@ -55,8 +55,9 @@ async def health():
 @app.get("/api/config")
 async def config():
     personas = [load_persona(agent_id) for agent_id in ("a", "b")]
-    return {"openai_configured": bool(os.getenv("OPENAI_API_KEY")), "text_model": TEXT_MODEL,
-            "voice_model": VOICE_MODEL, "a2a_version": "1.0", "personas": [
+    return {"azure_configured": azure_configured(), "text_model": TEXT_MODEL,
+            "voice_model": VOICE_MODEL, "a2a_version": "1.0",
+            "agent_urls": {"a": AGENT_A_URL, "b": AGENT_B_URL}, "personas": [
                 {"agent_id": persona.id, "name": persona.name, "style": persona.style, "voice": persona.voice}
                 for persona in personas]}
 
@@ -103,8 +104,9 @@ async def session_or_404(sid):
 
 @app.post("/api/sessions")
 async def create_session(body: SessionCreate):
-    if body.provider == "openai" and not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(400, "Add OPENAI_API_KEY to .env and restart before selecting OpenAI commentary")
+    if body.provider == "azure" and not azure_configured():
+        raise HTTPException(400, "Add AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT to .env and restart "
+                                 "before selecting Azure OpenAI commentary")
     try:
         return (await app.state.engine.create(body)).view()
     except ValueError as exc:
@@ -132,6 +134,44 @@ async def control(sid: str, body: SessionControl):
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return session.view()
+
+
+# Questions the booth politely declines rather than sending to the model.
+BLOCKED_QUESTION = re.compile(r"(?i)\b(bet|bets|betting|odds|spread|parlay|wager|gambl\w*|sportsbook|over/under|"
+                              r"fuck\w*|shit\w*|bitch\w*|asshole|damn)\b")
+
+
+@app.post("/api/sessions/{sid}/listener")
+async def listener(sid: str, body: ListenerInput):
+    """Listener input reaches the hosts as booth data at the next natural break."""
+    session = await session_or_404(sid)
+    state = session.listener
+    clock = asyncio.get_running_loop().time()
+    if body.side:
+        state["side"] = body.side
+    if body.reaction:
+        # A cheer or boo every half second at most; a held button is one voice, not a crowd.
+        if clock - state.get("last_reaction", 0) >= 0.5:
+            state["last_reaction"] = clock
+            state["cheers" if body.reaction == "cheer" else "boos"] = min(99, state.get(
+                "cheers" if body.reaction == "cheer" else "boos", 0) + 1)
+    if body.poll_vote:
+        poll = state.get("poll")
+        if not poll or poll.get("event_id") != body.poll_event_id:
+            raise HTTPException(409, "That poll has closed")
+        poll["pick"] = body.poll_vote
+    if body.question:
+        question = " ".join(body.question.split())
+        if BLOCKED_QUESTION.search(question):
+            raise HTTPException(422, "The booth keeps it family-friendly and never talks betting. Try another question.")
+        if clock - state.get("last_question", 0) < 20 or len(state["questions"]) >= 3:
+            raise HTTPException(429, "The booth already has a question waiting. Try again after the next play.")
+        state["last_question"] = clock
+        state["questions"].append(question)
+    await app.state.engine.emit(session, "listener", {key: state.get(key) for key in ("side", "cheers", "boos")}
+                                | {"questions_waiting": len(state["questions"]), "poll": public_poll(state.get("poll"))})
+    return {"side": state.get("side"), "cheers": state.get("cheers", 0), "boos": state.get("boos", 0),
+            "questions_waiting": len(state["questions"])}
 
 
 @app.get("/api/sessions/{sid}/export")
@@ -201,6 +241,8 @@ async def stream(websocket: WebSocket, sid: str, since: int = 0):
                 incoming = await websocket.receive_json()
                 if incoming.get("type") == "playback.ack" and session.player == listener:
                     segment_id = incoming.get("segment_id", "")
+                    if not incoming.get("cancelled"):
+                        session.heard.add(segment_id)
                     session.playback.setdefault(segment_id, asyncio.Event()).set()
                     await app.state.engine.emit(session, "trace", {"node": "playback", "phase": "cancelled" if incoming.get("cancelled") else "complete",
                         "segment_id": segment_id, "played_samples": incoming.get("played_samples", 0)})

@@ -13,10 +13,14 @@ from a2a.helpers.proto_helpers import new_data_part
 from a2a.types import CancelTaskRequest, Message, Role, SendMessageRequest, TaskState
 from google.protobuf.json_format import MessageToDict
 
-from backend.contracts import AgentRequest, CommentaryTurn, uid
+from backend.contracts import AgentRequest, CommentaryTurn, ReplyDraft, uid
 from backend.security import redact
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+# Turns each A2A mode must return: a call and its reply, one line, or none (a draft).
+EXPECTED_TURNS = {"exchange": 2, "segment": 2, "reply": 1, "setup": 1, "draft": 0}
 
 
 async def exchange(url: str, payload: AgentRequest, emit: Emit,
@@ -26,11 +30,27 @@ async def exchange(url: str, payload: AgentRequest, emit: Emit,
     Cancellation closes the HTTP stream and explicitly cancels the remote SDK
     task, including nested peer work. No direct Python agent calls are used.
     """
+    turns, _ = await _call(url, payload, emit, cancel_event)
+    return turns
+
+
+async def draft_reply(url: str, payload: AgentRequest, emit: Emit,
+                      cancel_event: asyncio.Event | None = None) -> ReplyDraft:
+    """Ask the partner to write (not speak) a reply to a validated script."""
+    if payload.mode != "draft":
+        raise ValueError("draft_reply requires a draft request")
+    _, drafts = await _call(url, payload, emit, cancel_event)
+    return drafts[0]
+
+
+async def _call(url: str, payload: AgentRequest, emit: Emit,
+                cancel_event: asyncio.Event | None) -> tuple[list[CommentaryTurn], list[ReplyDraft]]:
     started = time.perf_counter()
     task_id: str | None = None
     client = None
     remote_terminal = False
     turns: list[CommentaryTurn] = []
+    drafts: list[ReplyDraft] = []
     seen_artifacts: set[str] = set()
     received_ids: set[str] = set()
     task_known = asyncio.Event()
@@ -59,6 +79,8 @@ async def exchange(url: str, payload: AgentRequest, emit: Emit,
                 if turn.id not in received_ids:
                     received_ids.add(turn.id)
                     turns.append(turn)
+            if app_event["type"] == "draft":
+                drafts.append(ReplyDraft.model_validate(app_event["data"]["draft"]))
             await emit(app_event)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(65, connect=5), trust_env=False) as http:
@@ -155,23 +177,29 @@ async def exchange(url: str, payload: AgentRequest, emit: Emit,
                 await asyncio.gather(consumer, *([waiter] if waiter else []), return_exceptions=True)
             if not remote_terminal:
                 raise RuntimeError("A2A stream ended without a completed task")
-            if not turns:
+            if payload.mode == "draft":
+                if turns or len(drafts) != 1:
+                    raise ValueError("A2A draft must return exactly one drafted reply and no spoken turn")
+                if drafts[0].basis != payload.peer_utterance.text:
+                    raise ValueError("A2A draft answered a different script")
+            elif not turns:
                 raise RuntimeError("A2A task completed without a commentary turn")
-            expected_count = 2 if payload.mode == "exchange" else 1
+            expected_count = EXPECTED_TURNS[payload.mode]
             if len(turns) != expected_count:
                 raise ValueError(f"A2A {payload.mode} must return exactly {expected_count} commentary turn(s)")
-            if payload.mode == "exchange":
+            if payload.mode in {"exchange", "segment"}:
                 if turns[0].agent_id == turns[1].agent_id or turns[1].reply_to_turn_id != turns[0].id:
                     raise ValueError("A2A exchange did not contain an opposing reply to the lead turn")
-            elif (payload.peer_utterance is None or turns[0].agent_id == payload.peer_utterance.agent_id
-                  or turns[0].reply_to_turn_id != payload.peer_utterance.id):
+            elif payload.mode == "reply" and (payload.peer_utterance is None
+                                              or turns[0].agent_id == payload.peer_utterance.agent_id
+                                              or turns[0].reply_to_turn_id != payload.peer_utterance.id):
                 raise ValueError("A2A reply did not match its supplied peer utterance")
             await emit({"type": "trace", "data": {"node": "a2a.receive", "phase": "complete", "task_id": task_id,
                                                       "target": url, "turn_count": len(turns),
                                                       "exchange_id": payload.exchange_id,
                                                       "snapshot_hash": payload.snapshot.hash,
                                                       "latency_ms": round((time.perf_counter() - started) * 1000, 1)}})
-            return turns
+            return turns, drafts
         finally:
             if client is not None:
                 if task_id and not remote_terminal:

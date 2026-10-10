@@ -89,4 +89,10 @@ describe('reconnect and cancellation', () => {
     expect(next.seq).toBe(2);
     expect(next.id).toBe('run');
   });
+  it('advances past audio chunks without letting them evict protocol traces', () => {
+    const traced = reduceEvent(session, event(1, 1, 'trace', { node: 'a2a.send' }));
+    const next = reduceEvent(traced, event(2, 1, 'audio', { pcm: 'AAAA' }));
+    expect(next.seq).toBe(2);
+    expect(next.events.map((e) => e.type)).toEqual(['trace']);
+  });
 });

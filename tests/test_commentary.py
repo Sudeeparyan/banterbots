@@ -3,8 +3,10 @@ import json
 
 import pytest
 
-from backend.commentary import Draft, Persona, build_prompt, demo_draft, derived_facts, load_persona, validate_draft
-from backend.contracts import AgentRequest, CommentaryTurn, GameSnapshot
+from backend.commentary import (Draft, Persona, build_prompt, demo_draft, derived_facts, draft_mismatch, fact_issue,
+                                game_stats, generate_turn, load_persona, presnap_event, ready_for_reply, validate_draft,
+                                word_limit, words_remaining)
+from backend.contracts import AgentRequest, CommentaryTurn, GameSnapshot, ReplyDraft
 from backend.providers import get_replay_events
 
 
@@ -202,7 +204,7 @@ def test_editable_delivery_and_small_word_budget_change_offline_behavior():
         Persona.model_validate(dict(backwards_compatible, demo_delivery={"banter_frequency": 2}))
 
 
-def test_openai_prompt_exposes_trusted_analysis_and_observed_peer():
+def test_azure_prompt_exposes_trusted_analysis_and_observed_peer():
     event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "320")
     request = reply_request(payload(event))
     request.peer_utterance.spoken_text = "Henry picks up three. A small gain."
@@ -264,3 +266,251 @@ def test_field_goal_reply_adds_score_perspective_without_repeating_the_kick():
     assert "Elliott" not in response.text and "good" not in response.text.lower()
     assert "Eagles 10" not in response.text
     validate_draft(response, request, load_persona("b"))
+
+
+@pytest.mark.asyncio
+async def test_generated_demo_turn_has_event_sensitive_delivery_without_spoken_directions():
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "391")
+    events = []
+
+    async def emit(value):
+        events.append(value)
+
+    turn = await generate_turn(payload(event), load_persona("b"), "delivery-task", emit)
+    # Riley's team scores: the call explodes. The home crowd at Kansas City groans
+    # while the visiting Baltimore pocket cheers.
+    assert turn.delivery.reason == "touchdown" and turn.delivery.contour == "explode"
+    assert turn.delivery.energy >= 0.95 and turn.delivery.moment == "big"
+    assert turn.delivery.sound_cue == "crowd_groan" and turn.delivery.away_pocket > 0
+    assert turn.text.startswith(("Yes!", "Oh, yes!", "Here we go!"))
+    assert "[" not in turn.text and "<break" not in turn.text
+    assert any(value["type"] == "trace" and value["data"].get("node") == "delivery" for value in events)
+
+
+def test_text_prompt_gives_listener_first_response_and_separate_delivery_plan():
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "391")
+    system, material = build_prompt(payload(event), load_persona("b"))
+    assert "listener who cannot see the screen" in system
+    assert "answer it first" in system and "No SSML" in system
+    assert json.loads(material)["delivery_plan"]["reason"] == "touchdown"
+
+
+def test_two_point_score_and_between_downs_penalty_both_reach_listener():
+    event = next(event for event in get_replay_events("2024_22_KC_PHI") if event.id == "3958")
+    request = payload(event)
+    call = demo_draft(request, load_persona("b"))
+    assert "two-point try is good" in call.text and "Illegal use of hands follows" in call.text
+    validate_draft(call, request, load_persona("b"))
+    reply = reply_request(request, "b")
+    response = demo_draft(reply, load_persona("a"))
+    assert "two-point try" not in response.text
+    validate_draft(response, reply, load_persona("a"))
+
+
+@pytest.mark.parametrize("direction", ["[excited]", "<break time='200ms'/>", "(laughs)", "*cheers*"])
+def test_model_performance_directions_are_rejected_before_voice(direction):
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "183")
+    draft = Draft(text=f"Henry gains 1 yard. {direction}", emotion="engaged", evidence=["event.description"])
+    with pytest.raises(ValueError, match="performance directions"):
+        validate_draft(draft, payload(event), load_persona("a"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deployment", ["gpt-6-luna", "studio-custom-text-alias"])
+async def test_azure_parse_uses_documented_low_effort_only_for_known_model(monkeypatch, deployment):
+    from types import SimpleNamespace
+
+    from backend import commentary
+
+    calls = []
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "183")
+    request = payload(event).model_copy(update={"provider": "azure"})
+    persona = load_persona("a")
+    draft = demo_draft(request, persona)
+
+    class Client:
+        responses = None
+
+        def __init__(self):
+            self.responses = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def parse(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(output_parsed=draft, id="bounded-response", usage=None)
+
+    monkeypatch.setattr(commentary, "TEXT_MODEL", deployment)
+    monkeypatch.setattr(commentary, "azure_configured", lambda: True)
+    monkeypatch.setattr(commentary, "azure_client", lambda **kwargs: Client())
+
+    async def emit(value):
+        pass
+
+    turn = await commentary.generate_turn(request, persona, "latency-test", emit)
+    assert turn.text == draft.text and len(calls) == 1
+    assert calls[0]["model"] == deployment and calls[0]["text_format"] is Draft
+    assert calls[0]["max_output_tokens"] == 700
+    if deployment == "gpt-6-luna":
+        assert calls[0]["reasoning"] == {"effort": "low"}
+    else:
+        assert "reasoning" not in calls[0]
+
+
+def presnap_request(events, index, agent_mode="setup"):
+    event = presnap_event(events[index], events[index - 1] if index else None)
+    snapshot = GameSnapshot(event=event, phase="pre_snap",
+                            drive_history=[prior.model_dump() for prior in events[max(0, index - 5):index]]).seal()
+    return AgentRequest(session_id="presnap", epoch=1, exchange_id=f"setup-{event.id}", snapshot=snapshot,
+                        mode=agent_mode, hop_budget=0, voice_enabled=False)
+
+
+def test_presnap_snapshot_cannot_carry_the_result():
+    events = get_replay_events("2024_01_BAL_KC")
+    index = next(i for i, event in enumerate(events) if event.id == "148")
+    request = presnap_request(events, index)
+    event = request.snapshot.event
+    assert event.description == "" and event.flags == [] and event.yards_gained is None and event.players == []
+    assert (event.down, event.distance, event.yardline) == (3, 11, 71)
+    assert (event.home_score, event.away_score) == (events[index - 1].home_score, events[index - 1].away_score)
+    persona = load_persona("b")
+    draft = demo_draft(request, persona)
+    assert draft.text.startswith("Third and 11, Ravens at their own 29")
+    validate_draft(draft, request, persona)
+    for leak in ("Third and 11. Hill caught it.", "Third and 11. Converted!", "Jackson gains 18 yards.",
+                 "Touchdown! Third and 11."):
+        with pytest.raises(ValueError):
+            validate_draft(Draft(text=leak, emotion="excited", evidence=["event.down"]), request, persona)
+    validate_draft(Draft(text="Third and 11. They need a touchdown drive.", emotion="engaged",
+                         evidence=["event.down"]), request, persona)
+
+
+@pytest.mark.parametrize("game_id", ["2024_01_BAL_KC", "2024_22_KC_PHI"])
+def test_every_presnap_setup_passes_its_gates(game_id):
+    events = get_replay_events(game_id)
+    for index, event in enumerate(events):
+        if event.down is None or event.play_type not in {"run", "pass", "punt", "field_goal"}:
+            continue
+        request = presnap_request(events, index)
+        for agent_id in ("a", "b"):
+            persona = load_persona(agent_id)
+            draft = demo_draft(request, persona)
+            validate_draft(draft, request, persona)
+            assert len(draft.text.split()) <= word_limit(persona, request)
+
+
+def test_moment_budgets_keep_routine_short_and_let_big_plays_run():
+    events = get_replay_events("2024_01_BAL_KC")
+    routine = payload(next(event for event in events if event.id == "183"))
+    big = payload(next(event for event in events if event.id == "391"))
+    persona = load_persona("a")
+    assert word_limit(persona, routine) <= 16 < word_limit(persona, big)
+    assert word_limit(persona, reply_request(routine, "b")) <= 14
+    long_routine = Draft(text=" ".join(["word"] * 20), emotion="engaged", evidence=["event.description"])
+    with pytest.raises(ValueError, match="word limit"):
+        validate_draft(long_routine, routine, persona)
+
+
+def segment_request(events, index, topic, booth=None, mode="segment"):
+    event = events[index]
+    stats = game_stats(events, event)
+    snapshot = GameSnapshot(event=event, phase="segment", booth={"stats": stats, **(booth or {})}).seal()
+    return AgentRequest(session_id="segment", epoch=1, exchange_id=f"{topic}-{event.id}", snapshot=snapshot,
+                        mode=mode, topic=topic, voice_enabled=False)
+
+
+def test_segments_quote_only_causal_totals_and_the_frozen_score():
+    events = get_replay_events("2024_01_BAL_KC")
+    half = next(i for i, event in enumerate(events) if event.id == "2145")
+    stats = game_stats(events, events[half])
+    expected = sum(int(event.yards_gained or 0) for event in events[:half + 1]
+                   if (event.offense_team or event.possession) == "KC" and event.play_type in {"run", "pass"}
+                   and not set(event.flags) & {"no_play", "reversed", "play_deleted"})
+    assert stats["teams"]["KC"]["yards"] == expected
+    assert game_stats(events, events[-1])["teams"]["KC"]["yards"] != expected  # later plays are excluded at halftime
+    for topic, index in (("halftime", half), ("final", len(events) - 1), ("quarter", 34)):
+        request = segment_request(events, index, topic)
+        persona = load_persona("a")
+        draft = demo_draft(request, persona)
+        validate_draft(draft, request, persona)
+        assert f"{events[index].home_score}" in draft.text
+    final = demo_draft(segment_request(events, len(events) - 1, "final"), load_persona("a"))
+    assert "We win it" in final.text
+    with pytest.raises(ValueError, match="numeric"):
+        validate_draft(Draft(text="The Chiefs have 999 yards.", emotion="engaged", evidence=["booth"]),
+                       segment_request(events, half, "halftime"), load_persona("a"))
+
+
+def test_callbacks_must_point_at_a_real_remembered_remark():
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "183")
+    memory = [{"id": "m1", "agent_id": "b", "text": "Henry won't find a yard all day."}]
+    request = AgentRequest(session_id="memory", epoch=1, exchange_id="x",
+                           snapshot=GameSnapshot(event=event, booth={"memory": memory}).seal(), voice_enabled=False)
+    persona = load_persona("a")
+    validate_draft(Draft(text="Henry, 1 yard. Found one, Riley.", emotion="dry", evidence=["booth"],
+                         callback_to="m1"), request, persona)
+    # A label naming no remembered remark is dropped; the line itself still airs.
+    invented = Draft(text="Henry, 1 yard. Found one, Riley.", emotion="dry", evidence=["booth"], callback_to="m9")
+    validate_draft(invented, request, persona)
+    assert invented.callback_to is None
+
+
+def test_reply_drafted_during_speech_is_used_only_when_spoken_words_carry_its_facts():
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "391")
+    request = reply_request(payload(event), "a")
+    script = request.peer_utterance.text
+    draft = ReplyDraft(text="Yes! Our finish, Max. Henry earned it.", basis=script, emotion="excited",
+                       evidence=["partner"])
+    request.peer_utterance.spoken_text = script.replace("5", "five")
+    assert draft_mismatch(request.model_copy(update={"draft": draft})) is None
+    request.peer_utterance.spoken_text = "Touchdown, wow."
+    assert "omitted" in draft_mismatch(request.model_copy(update={"draft": draft}))
+    request.peer_utterance.spoken_text = script
+    other = draft.model_copy(update={"basis": "x"})
+    assert "different script" in draft_mismatch(request.model_copy(update={"draft": other}))
+    flagged = request.peer_utterance.model_copy(update={"fact_flag": "wrong score"})
+    assert "correct the record" in draft_mismatch(request.model_copy(update={"draft": draft, "peer_utterance": flagged}))
+
+
+@pytest.mark.asyncio
+async def test_generate_turn_reuses_a_valid_draft_without_calling_the_model():
+    event = next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "391")
+    request = reply_request(payload(event), "a")
+    request.peer_utterance.spoken_text = request.peer_utterance.text
+    draft = ReplyDraft(text="Yes! Our finish, Max.", basis=request.peer_utterance.text, emotion="excited",
+                       evidence=["partner"])
+    events = []
+
+    async def emit(value):
+        events.append(value)
+
+    turn = await generate_turn(request.model_copy(update={"draft": draft, "provider": "azure"}), load_persona("b"),
+                               "draft-task", emit)
+    assert turn.text == "Yes! Our finish, Max." and turn.kind == "reply"
+    assert any(value["data"].get("phase") == "draft_reused" for value in events)
+
+
+def test_spoken_words_are_audited_with_the_same_fact_gates():
+    events = get_replay_events("2024_01_BAL_KC")
+    request = payload(next(event for event in events if event.id == "391"))
+    assert fact_issue("Oh yes! Henry, five yards, touchdown Ravens!", request) is None
+    assert "numeric" in fact_issue("Henry, 15 yards, touchdown Ravens!", request)
+    reversed_play = payload(next(event for event in events if event.id == "4221"))
+    assert "touchdown" in fact_issue("Touchdown Ravens!", reversed_play)
+
+
+def test_partner_starts_only_after_every_fact_is_heard_and_a_few_words_remain():
+    request = payload(next(event for event in get_replay_events("2024_01_BAL_KC") if event.id == "391"))
+    script = "Touchdown Ravens! Henry from 5 yards out, and Baltimore strikes first in Kansas City."
+    assert words_remaining(script, "Touchdown Ravens! Oh, Henry from five yards out") == 7
+    # Facts heard but too much of the line left: the partner waits.
+    assert not ready_for_reply(request, script, "Touchdown Ravens! Henry from five yards out,")
+    assert ready_for_reply(request, script, "Touchdown Ravens! Yes! Henry from five yards out, and Baltimore strikes first")
+    # A missing name or number never hands off early, nor does a misspoken fact.
+    assert not ready_for_reply(request, "Henry from 5, touchdown Ravens, and that is that.", "Henry from, touchdown Ravens, and that")
+    assert not ready_for_reply(request, script, "Touchdown Ravens! Henry from fifteen yards out, and Baltimore strikes first")
+    assert not ready_for_reply(request, script, "")

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   Activity,
@@ -21,7 +21,6 @@ import {
   Radio,
   RotateCcw,
   Settings2,
-  ShieldCheck,
   SkipForward,
   Sparkles,
   Terminal,
@@ -33,10 +32,30 @@ import {
   Zap,
 } from 'lucide-react';
 import { api, post } from './types';
-import type { Config, Feed, Game, RunEvent, SavedRun, Session, Team, Turn } from './types';
+import type {
+  Config,
+  Feed,
+  Game,
+  RunEvent,
+  SavedRun,
+  Session,
+  Team,
+  Turn,
+  VocalDelivery,
+} from './types';
 import { mergeSessionView, reduceEvent } from './session';
 import { BroadcastAudio } from './audio';
-import { exchangesFor, nflDate, transcriptFor } from './broadcast';
+import { Presenter } from './presenter';
+import { ListenerPanel } from './ListenerPanel';
+import {
+  agentFlowFor,
+  exchangesFor,
+  handoffsFor,
+  nflDate,
+  transcriptFor,
+  turnLabel,
+} from './broadcast';
+import { AgentNetwork, StudioGuide, stepSentence } from './AgentNetwork';
 
 const asText = (value: unknown) =>
   typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -97,6 +116,9 @@ function Wave({ active = false }: { active?: boolean }) {
     </div>
   );
 }
+const GUIDE_HIDDEN = 'banterbots.guide-hidden';
+const STADIUM_SOUND = 'banterbots.stadium-sound';
+const STADIUM_LEVEL = 'banterbots.stadium-level';
 function App() {
   type Highlight = {
     index: number;
@@ -112,7 +134,7 @@ function App() {
   const [session, setSession] = useState<Session | null>(null),
     [saved, setSaved] = useState<SavedRun[]>([]);
   const [mode, setMode] = useState<'replay' | 'live'>('replay'),
-    [provider, setProvider] = useState<'demo' | 'openai'>('demo');
+    [provider, setProvider] = useState<'demo' | 'azure'>('demo');
   const [selectedTeam, setSelectedTeam] = useState<string | null>(null),
     [selectedGame, setSelectedGame] = useState('2024_01_BAL_KC');
   const [date, setDate] = useState(nflDate()),
@@ -123,6 +145,22 @@ function App() {
   const [muted, setMuted] = useState(true),
     [speaking, setSpeaking] = useState<string | null>(null),
     [connected, setConnected] = useState(false);
+  const [stadiumSound, setStadiumSound] = useState(() => {
+    try {
+      return localStorage.getItem(STADIUM_SOUND) !== 'off';
+    } catch {
+      return true;
+    }
+  });
+  const [stadiumLevel, setStadiumLevel] = useState(() => {
+    try {
+      const savedLevel = localStorage.getItem(STADIUM_LEVEL);
+      const level = savedLevel === null ? 0.35 : Number(savedLevel);
+      return Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0.35;
+    } catch {
+      return 0.35;
+    }
+  });
   const [debug, setDebug] = useState(false),
     [debugTab, setDebugTab] = useState('timeline'),
     [historyOpen, setHistoryOpen] = useState(false),
@@ -138,6 +176,15 @@ function App() {
   const [following, setFollowing] = useState(true),
     [health, setHealth] = useState<{ a: boolean; b: boolean } | null>(null),
     [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [healthCheck, setHealthCheck] = useState(0),
+    [healthCheckedAt, setHealthCheckedAt] = useState<number | null>(null);
+  const [guideOpen, setGuideOpen] = useState(() => {
+    try {
+      return localStorage.getItem(GUIDE_HIDDEN) !== '1';
+    } catch {
+      return true;
+    }
+  });
   const followingRef = useRef(true);
   const conversationRef = useRef<HTMLDivElement | null>(null);
   const teamRail = useRef<HTMLDivElement | null>(null);
@@ -152,7 +199,8 @@ function App() {
     mutedRef = useRef(true),
     savedRef = useRef(false);
   const transcriptEnd = useRef<HTMLDivElement | null>(null),
-    audioRef = useRef<BroadcastAudio | null>(null);
+    audioRef = useRef<BroadcastAudio | null>(null),
+    presenterRef = useRef<Presenter | null>(null);
   if (!audioRef.current)
     audioRef.current = new BroadcastAudio(
       setSpeaking,
@@ -166,6 +214,8 @@ function App() {
               cancelled,
             }),
           );
+        // A heard segment releases what the screen was holding behind it.
+        queueMicrotask(() => presenterRef.current?.drain());
       },
       (message, audioMuted) => {
         setError(message);
@@ -186,6 +236,22 @@ function App() {
     mutedRef.current = muted;
   }, [muted]);
   useEffect(() => {
+    audioRef.current?.setSoundscape(stadiumSound, stadiumLevel);
+    try {
+      localStorage.setItem(STADIUM_SOUND, stadiumSound ? 'on' : 'off');
+      localStorage.setItem(STADIUM_LEVEL, String(stadiumLevel));
+    } catch {
+      /* The current listening preference still works without storage. */
+    }
+  }, [stadiumSound, stadiumLevel]);
+  useEffect(() => {
+    audioRef.current?.setBroadcastActive(
+      connected &&
+        !readingSaved &&
+        ['playing', 'running', 'stepping'].includes(session?.status ?? ''),
+    );
+  }, [connected, readingSaved, session?.status]);
+  useEffect(() => {
     savedRef.current = readingSaved;
   }, [readingSaved]);
   useEffect(() => {
@@ -205,6 +271,7 @@ function App() {
         if (alive) setHealth({ a: false, b: false });
       } finally {
         pending = false;
+        if (alive) setHealthCheckedAt(Date.now());
       }
     };
     void poll();
@@ -213,7 +280,7 @@ function App() {
       alive = false;
       clearInterval(timer);
     };
-  }, [connectionAttempt]);
+  }, [connectionAttempt, healthCheck]);
   useEffect(() => {
     if (mode !== 'replay') {
       setHighlights([]);
@@ -294,7 +361,7 @@ function App() {
     async (
       gameId: string,
       currentMode: 'replay' | 'live',
-      currentProvider: 'demo' | 'openai',
+      currentProvider: 'demo' | 'azure',
       startIndex?: number,
       currentDate = date,
     ) => {
@@ -400,35 +467,14 @@ function App() {
       retry: ReturnType<typeof setTimeout>;
     let ownedSocket: WebSocket | null = null;
     const id = session.id;
-    const connect = () => {
-      if (disposed) return;
-      const ws = new WebSocket(
-        `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/sessions/${id}/stream?since=${seq.current}`,
-      );
-      socket.current = ws;
-      ownedSocket = ws;
-      ws.onopen = () => {
-        if (disposed || socket.current !== ws) return;
-        setConnected(true);
-      };
-      ws.onmessage = (event) => {
-        if (disposed || socket.current !== ws || sessionRef.current?.id !== id) return;
-        let item: RunEvent;
-        try {
-          item = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (item.session_id !== id || item.seq <= seq.current || item.epoch < epoch.current) return;
-        const historical = Boolean(
-          item.data.historical || (item as RunEvent & { historical?: boolean }).historical,
-        );
-        seq.current = item.seq;
-        if (item.epoch > epoch.current) {
-          epoch.current = item.epoch;
-          audioRef.current?.clear();
-          setCaptions({});
-        }
+    const isHistorical = (item: RunEvent) =>
+      Boolean(item.data.historical || (item as RunEvent & { historical?: boolean }).historical);
+    // Score, captions and turns appear when the audio before them has been heard.
+    const presenter = new Presenter(
+      (segment) => audioRef.current?.pending(segment) ?? false,
+      (item, silent) => {
+        if (disposed || sessionRef.current?.id !== id) return;
+        const historical = silent || isHistorical(item);
         setSession((current) => (current ? reduceEvent(current, item) : current));
         if (item.type === 'turn') {
           const turn = item.data.turn as Turn;
@@ -440,7 +486,12 @@ function App() {
             });
           }
           if (turn?.mode === 'demo' && !historical)
-            audioRef.current?.demo(turn.spoken_text ?? turn.text, turn.agent_id, turn.id);
+            audioRef.current?.demo(
+              turn.spoken_text ?? turn.text,
+              turn.agent_id,
+              turn.id,
+              turn.delivery ?? undefined,
+            );
         }
         if (item.type === 'turn.start' && !historical)
           setCaptions((previous) => ({
@@ -467,17 +518,58 @@ function App() {
               },
             };
           });
+        if (item.type === 'error' && !historical)
+          setError(asText(item.data.message ?? item.data.error ?? item.data));
+      },
+    );
+    presenterRef.current = presenter;
+    const connect = () => {
+      if (disposed) return;
+      const ws = new WebSocket(
+        `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/sessions/${id}/stream?since=${seq.current}`,
+      );
+      socket.current = ws;
+      ownedSocket = ws;
+      ws.onopen = () => {
+        if (disposed || socket.current !== ws) return;
+        setConnected(true);
+      };
+      ws.onmessage = (event) => {
+        if (disposed || socket.current !== ws || sessionRef.current?.id !== id) return;
+        let item: RunEvent;
+        try {
+          item = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (item.session_id !== id || item.seq <= seq.current || item.epoch < epoch.current) return;
+        const historical = isHistorical(item);
+        seq.current = item.seq;
+        if (item.epoch > epoch.current) {
+          epoch.current = item.epoch;
+          audioRef.current?.clear();
+          presenter.flush();
+          setCaptions({});
+        }
+        // Audio is scheduled the moment it arrives; the screen follows what is heard.
+        if (item.type === 'turn.start' && !historical && item.data.delivery) {
+          audioRef.current?.prepare(
+            String(item.data.segment_id ?? item.data.turn_id),
+            `${item.session_id}:${item.epoch}:${item.data.exchange_id}:${item.data.event_id}:${item.data.event_revision ?? 1}`,
+            item.data.delivery as VocalDelivery,
+          );
+        }
         if (item.type === 'audio' && !historical)
           audioRef.current?.chunk(item.data as unknown as Parameters<BroadcastAudio['chunk']>[0]);
         if (item.type === 'segment.sealed' && !item.data.browser_speech && !historical)
           audioRef.current?.seal(item.data as unknown as Parameters<BroadcastAudio['seal']>[0]);
-        if (item.type === 'error' && !historical)
-          setError(asText(item.data.message ?? item.data.error ?? item.data));
+        if (item.type !== 'audio') presenter.push(item, historical);
       };
       ws.onclose = () => {
         if (disposed || socket.current !== ws) return;
         setConnected(false);
         audioRef.current?.clear();
+        presenter.flush();
         setCaptions({});
         if (!disposed) retry = setTimeout(connect, 1200);
       };
@@ -489,6 +581,7 @@ function App() {
     return () => {
       disposed = true;
       clearTimeout(retry);
+      if (presenterRef.current === presenter) presenterRef.current = null;
       if (socket.current === ownedSocket) {
         audioRef.current?.clear();
         socket.current = null;
@@ -604,7 +697,7 @@ function App() {
       setBusy(false);
     }
   };
-  const changeProvider = async (next: 'demo' | 'openai') => {
+  const changeProvider = async (next: 'demo' | 'azure') => {
     if (busy || startingHighlight || openPending.current) return;
     if (session) {
       const opened = await openSession(selectedGame, mode, next);
@@ -612,17 +705,33 @@ function App() {
     } else setProvider(next);
   };
   const toggleVoice = async () => {
-    const next = !muted;
+    const next = !mutedRef.current;
+    mutedRef.current = next;
     setMuted(next);
     audioRef.current?.mute(next);
     if (!next) {
+      setError('');
       try {
         await audioRef.current?.unlock();
-      } catch {
+      } catch (e) {
+        mutedRef.current = true;
         setMuted(true);
         audioRef.current?.mute(true);
-        setError('Your browser could not enable audio. Commentary captions are still available.');
+        setError(`Could not enable voice. ${(e as Error).message}. Try enabling voice again.`);
       }
+    }
+  };
+  const testVoice = async () => {
+    setError('');
+    mutedRef.current = false;
+    setMuted(false);
+    try {
+      await audioRef.current?.testVoice();
+    } catch (e) {
+      mutedRef.current = true;
+      setMuted(true);
+      audioRef.current?.mute(true);
+      setError(`Could not test voice. ${(e as Error).message}. Try enabling voice again.`);
     }
   };
   const viewSaved = async (id: string) => {
@@ -780,6 +889,33 @@ function App() {
     error ||
     (mode === 'live' && !readingSaved && activeFeed.error ? `Game feed: ${activeFeed.error}` : '');
   const lastTurn = turns[turns.length - 1];
+  const flow = agentFlowFor(session),
+    handoffs = handoffsFor(session);
+  const names = {
+    a: config?.personas.find((p) => p.agent_id === 'a')?.name ?? 'Max Carter',
+    b: config?.personas.find((p) => p.agent_id === 'b')?.name ?? 'Riley Brooks',
+  };
+  const activeStep =
+    flow?.status === 'running' ? flow.steps.find((step) => step.state === 'active') : undefined;
+  const replies = turns.filter((turn) => turn.reply_to_turn_id).length;
+  const canStep =
+    Boolean(session) &&
+    !busy &&
+    !startingHighlight &&
+    !readingSaved &&
+    !playing &&
+    !stepping &&
+    connected &&
+    !agentUnavailable &&
+    session?.status !== 'completed';
+  const toggleGuide = (open: boolean) => {
+    setGuideOpen(open);
+    try {
+      localStorage.setItem(GUIDE_HIDDEN, open ? '0' : '1');
+    } catch {
+      /* the guide simply reappears next visit */
+    }
+  };
   return (
     <div className="app-shell">
       <header className="site-header">
@@ -1015,13 +1151,14 @@ function App() {
           </span>
           <span>
             {provider === 'demo'
-              ? 'Demo commentary · real plays, scripted voices. Add an API key for generated commentary.'
-              : 'OpenAI commentary · two original commentators, one shared game snapshot.'}
+              ? 'Demo commentary · real plays, scripted voices. Add Azure OpenAI credentials for generated commentary.'
+              : 'Azure OpenAI commentary · two original commentators, one shared game snapshot.'}
           </span>
-          <button onClick={() => setHelp(true)}>
+          <button onClick={() => toggleGuide(!guideOpen)} aria-expanded={guideOpen}>
             How it works <ChevronRight size={14} />
           </button>
         </div>
+        {guideOpen && <StudioGuide onClose={() => toggleGuide(false)} />}
         {mode === 'replay' && highlights.length > 0 && !readingSaved && (
           <section className="moment-strip" aria-label="Replay moments">
             <div className="moment-title">
@@ -1345,19 +1482,95 @@ function App() {
             </section>
           </div>
           <div className="booth-column">
+            <AgentNetwork
+              flow={flow}
+              names={names}
+              colors={{ a: home?.color, b: away?.color }}
+              urls={config?.agent_urls}
+              health={health}
+              checkedAgo={
+                healthCheckedAt ? elapsed(new Date(healthCheckedAt).toISOString()) : 'not yet'
+              }
+              connected={connected}
+              readingSaved={readingSaved}
+              replies={replies}
+              canTest={canStep}
+              onTest={() => void control('step')}
+              onRecheck={() => setHealthCheck((value) => value + 1)}
+            />
             <section className="panel booth-panel">
               <div className="panel-header">
                 <span>
                   <Mic size={15} /> THE COMMENTARY BOOTH
                 </span>
+                <div className="booth-audio-controls">
+                  {provider === 'demo' && (
+                    <button
+                      className="voice-control"
+                      onClick={() => void testVoice()}
+                      disabled={busy || startingHighlight || speaking !== null}
+                    >
+                      <Play size={13} /> Test voice
+                    </button>
+                  )}
+                  <button
+                    className={`voice-control ${!muted ? 'enabled' : ''}`}
+                    onClick={() => void toggleVoice()}
+                    aria-pressed={!muted}
+                  >
+                    {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                    {muted ? 'Enable voice' : 'Voice on'}
+                  </button>
+                </div>
+              </div>
+              <p className="voice-hint">
+                {muted
+                  ? 'Sound is off. Enable voice to hear the next play.'
+                  : provider === 'demo'
+                    ? config?.azure_configured
+                      ? 'Preview voice: robotic browser speech. Use expressive voices for the real broadcast.'
+                      : 'Preview voice: robotic browser speech. Add Azure OpenAI credentials for expressive voices.'
+                    : 'Expressive GPT-Live voices are on. Advance a play to hear commentary.'}
+              </p>
+              {provider === 'demo' && <span className="preview-voice-label">PREVIEW VOICE</span>}
+              {provider === 'demo' && config?.azure_configured && (
                 <button
-                  className={`voice-control ${!muted ? 'enabled' : ''}`}
-                  onClick={() => void toggleVoice()}
-                  aria-pressed={!muted}
+                  className="expressive-voice-button"
+                  disabled={busy || startingHighlight || playing || stepping || readingSaved}
+                  onClick={() => void changeProvider('azure')}
                 >
-                  {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}Voice{' '}
-                  {muted ? 'off' : 'on'}
+                  <Sparkles size={14} /> Use expressive voices
+                  <ArrowRight size={14} />
                 </button>
+              )}
+              <div className="broadcast-mix">
+                <div>
+                  <span className="eyebrow">BROADCAST SOUND</span>
+                  <p>Play-aware voices. Friendly rivalry. A little stadium atmosphere.</p>
+                </div>
+                <button
+                  className={`voice-control ${stadiumSound ? 'enabled' : ''}`}
+                  aria-label="Stadium atmosphere"
+                  aria-pressed={stadiumSound}
+                  onClick={() => setStadiumSound((value) => !value)}
+                  title="Recorded crowd (CC0) with play reactions; voices stay in front"
+                >
+                  <Radio size={14} /> Stadium {stadiumSound ? 'on' : 'off'}
+                </button>
+              </div>
+              <div className="crowd-level">
+                <label htmlFor="crowd-level">Crowd level</label>
+                <input
+                  id="crowd-level"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={Math.round(stadiumLevel * 100)}
+                  disabled={!stadiumSound}
+                  onChange={(e) => setStadiumLevel(Number(e.target.value) / 100)}
+                />
+                <output htmlFor="crowd-level">{Math.round(stadiumLevel * 100)}%</output>
               </div>
               <div className="persona-grid">
                 {(['a', 'b'] as const).map((agent, i) => {
@@ -1415,18 +1628,14 @@ function App() {
                   );
                 })}
               </div>
-              <div className="booth-flow">
-                <span>
-                  <ShieldCheck size={13} /> Shared play
-                </span>
-                <ArrowRight size={13} />
-                <span>
-                  <MessageCircle size={13} /> Call + reply
-                </span>
-                <ArrowRight size={13} />
-                <span>Next play</span>
-              </div>
             </section>
+            <ListenerPanel
+              session={session}
+              disabled={!session || readingSaved}
+              homeName={home?.abbreviation ?? game?.home_team ?? 'Home'}
+              awayName={away?.abbreviation ?? game?.away_team ?? 'Away'}
+              onReaction={(kind) => audioRef.current?.listenerReaction(kind)}
+            />
             <section className="panel conversation-panel">
               <div className="panel-header">
                 <span>
@@ -1444,14 +1653,18 @@ function App() {
                 </span>
                 <span>
                   {playing || stepping
-                    ? `${currentLead} is in the booth`
+                    ? activeStep
+                      ? `${stepSentence(activeStep, names)}…`
+                      : `${currentLead} is in the booth`
                     : lastTurn?.reply_to_turn_id
                       ? 'Call delivered. Rival answered.'
                       : lastTurn
                         ? 'Lead call saved. Exchange interrupted.'
                         : 'Ready when you are.'}
                 </span>
-                <strong>{turns.filter((turn) => turn.reply_to_turn_id).length} exchanges</strong>
+                <strong>
+                  {replies} {replies === 1 ? 'exchange' : 'exchanges'}
+                </strong>
               </div>
               {!following && (
                 <button className="follow-latest" onClick={followLatest}>
@@ -1507,43 +1720,57 @@ function App() {
                           </details>
                         )}
                         {exchange.turns.map((turn) => (
-                          <article
-                            className={`commentary-turn agent-${turn.agent_id} ${speaking === turn.agent_id && turn.id === (turn.agent_id === 'a' ? lastA : lastB)?.id ? 'talking' : ''}`}
-                            key={turn.id}
-                            style={teamColor(findTeam(turn.team_id))}
-                          >
-                            <div className="turn-avatar">
-                              <Logo team={findTeam(turn.team_id)} size={24} />
-                            </div>
-                            <div className="turn-body">
-                              <div className="turn-meta">
-                                <strong>{turn.persona}</strong>
-                                <span className="turn-team">{turn.team_id}</span>
-                                <span className="turn-kind">
-                                  {turn.reply_to_turn_id ? (
-                                    <>
-                                      <ArrowDown size={10} /> REPLY
-                                    </>
-                                  ) : (
-                                    'CALL'
-                                  )}
-                                </span>
-                                <time>{time(turn.created_at)}</time>
-                              </div>
-                              <p>
-                                {turn.mode === 'openai'
-                                  ? (turn.spoken_text ?? turn.text)
-                                  : turn.text}
-                              </p>
-                              <div className={`turn-proof ${debug ? 'show-proof' : ''}`}>
-                                <Check size={11} />
+                          <Fragment key={turn.id}>
+                            {turn.reply_to_turn_id && (
+                              <div className="handoff-note">
+                                <ArrowDown size={12} />
                                 <span>
-                                  Play {turn.event_id.split('_').pop()} · snapshot{' '}
-                                  {turn.snapshot_hash.slice(0, 8)}
+                                  {exchange.turns
+                                    .find((t) => t.id === turn.reply_to_turn_id)
+                                    ?.persona.split(' ')[0] ?? 'The lead'}{' '}
+                                  sent this call to {turn.persona.split(' ')[0]} over A2A
+                                  {handoffs.get(exchange.id)?.latencyMs != null &&
+                                    ` · reply in ${Math.round(handoffs.get(exchange.id)!.latencyMs!)} ms`}
                                 </span>
                               </div>
-                            </div>
-                          </article>
+                            )}
+                            <article
+                              className={`commentary-turn agent-${turn.agent_id} ${speaking === turn.agent_id && turn.id === (turn.agent_id === 'a' ? lastA : lastB)?.id ? 'talking' : ''}`}
+                              style={teamColor(findTeam(turn.team_id))}
+                            >
+                              <div className="turn-avatar">
+                                <Logo team={findTeam(turn.team_id)} size={24} />
+                              </div>
+                              <div className="turn-body">
+                                <div className="turn-meta">
+                                  <strong>{turn.persona}</strong>
+                                  <span className="turn-team">{turn.team_id}</span>
+                                  <span className="turn-kind">
+                                    {turn.reply_to_turn_id ? (
+                                      <>
+                                        <ArrowDown size={10} /> REPLY
+                                      </>
+                                    ) : (
+                                      turnLabel(turn)
+                                    )}
+                                  </span>
+                                  <time>{time(turn.created_at)}</time>
+                                </div>
+                                <p>
+                                  {turn.mode !== 'demo'
+                                    ? (turn.spoken_text ?? turn.text)
+                                    : turn.text}
+                                </p>
+                                <div className={`turn-proof ${debug ? 'show-proof' : ''}`}>
+                                  <Check size={11} />
+                                  <span>
+                                    Play {turn.event_id.split('_').pop()} · snapshot{' '}
+                                    {turn.snapshot_hash.slice(0, 8)}
+                                  </span>
+                                </div>
+                              </div>
+                            </article>
+                          </Fragment>
                         ))}
                       </section>
                     ))
@@ -1609,7 +1836,9 @@ function App() {
                     <i />
                     <i />
                     <i />
-                    <span>Reading the field…</span>
+                    <span>
+                      {activeStep ? `${stepSentence(activeStep, names)}…` : 'Reading the field…'}
+                    </span>
                   </div>
                 )}
                 <div ref={transcriptEnd} />
@@ -1639,7 +1868,7 @@ function App() {
         </div>
         <section className="studio-status">
           <div>
-            <span className="eyebrow">ENGINE ROOM</span>
+            <span className="eyebrow">COMMENTARY ENGINE</span>
             <select
               aria-label="Commentary provider"
               value={provider}
@@ -1647,9 +1876,9 @@ function App() {
               onChange={(e) => void changeProvider(e.target.value as typeof provider)}
             >
               <option value="demo">Demo · no API key needed</option>
-              <option value="openai" disabled={!config?.openai_configured}>
-                OpenAI ·{' '}
-                {config?.openai_configured ? 'key configured' : 'add credentials to enable'}
+              <option value="azure" disabled={!config?.azure_configured}>
+                Azure OpenAI ·{' '}
+                {config?.azure_configured ? 'key configured' : 'add credentials to enable'}
               </option>
             </select>
           </div>
@@ -1671,7 +1900,7 @@ function App() {
               </strong>
             </span>
             <span>
-              Peer exchanges <strong>{turns.filter((t) => t.reply_to_turn_id).length}</strong>
+              Agent replies <strong>{replies}</strong>
             </span>
           </div>
         </section>
@@ -1929,33 +2158,50 @@ function App() {
               </button>
             </div>
             <p>
-              Max backs the home team. Riley backs the visitors. Both see one frozen game snapshot,
-              then trade a call and a reply through A2A.
+              Two AI commentators watch the same real NFL play and talk about it. Max backs the home
+              team, Riley backs the visitors. They are separate programs that message each other.
             </p>
             <div className="help-step">
               <Play size={19} />
               <span>
-                <strong>Enter the replay room</strong>Choose a real game and press Start broadcast.
-                Use Next play to inspect a single exchange.
+                <strong>1. Start a play</strong>Pick an Instant Replay moment, press Start
+                broadcast, or press Next play to go one play at a time.
               </span>
             </div>
             <div className="help-step">
-              <Volume2 size={19} />
+              <MessageCircle size={19} />
               <span>
-                <strong>Turn up the rivalry</strong>Enable voice. Demo commentary uses browser
-                voices; OpenAI mode streams GPT-Live audio after credentials are configured.
+                <strong>2. Watch them talk</strong>The studio sends the play to one commentator.
+                That commentator makes a call and sends it to the other, who replies. Both lines
+                appear in The call &amp; response.
+              </span>
+            </div>
+            <div className="help-step">
+              <Activity size={19} />
+              <span>
+                <strong>3. Check it is working</strong>Agent network shows whether each service is
+                online and ticks off every message as it travels between them.
               </span>
             </div>
             <div className="help-step">
               <Code2 size={19} />
               <span>
-                <strong>Follow every handoff</strong>Open the debugger for graph stages, A2A
-                payloads, prompt context, errors, and correlated traces.
+                <strong>4. Look under the hood</strong>Agent debugger (shortcut D) shows the raw A2A
+                messages, the shared play facts and timings.
+              </span>
+            </div>
+            <div className="help-step">
+              <Volume2 size={19} />
+              <span>
+                <strong>Voice</strong>Enable voice to hear the next play (shortcut M). In Demo mode,
+                Test voice plays a short speaker check. Use expressive voices selects Azure
+                broadcast voices when configured. Stadium atmosphere is a recorded CC0 crowd that
+                lowers itself during speech, and has its own Crowd level control.
               </span>
             </div>
             <div className="help-note">
-              Live scores use ESPN’s polling feed. Poll time and latest-play time are reported
-              separately. Demo speech is intentionally labelled.
+              Keyboard: Space plays or pauses, → advances one play, M toggles voice, D opens the
+              debugger. Live mode reads ESPN's scoreboard; Replay uses recorded nflverse games.
             </div>
           </section>
         </div>
